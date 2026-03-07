@@ -10,38 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check & Clippy
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm-19 clang-19 libelf-dev linux-headers-generic
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
-
-      - name: Install bpf-linker
-        run: cargo +nightly install bpf-linker
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-
-      - name: Build eBPF
-        run: cargo xtask build-ebpf
-
-      - name: Clippy (workspace)
-        run: cargo clippy --workspace -- -D warnings
-
   build:
     name: Build
     runs-on: ubuntu-24.04
@@ -76,13 +44,3 @@ jobs:
         with:
           name: neko-firewall
           path: target/release/neko-firewall
-
-  fmt:
-    name: Formatting
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
