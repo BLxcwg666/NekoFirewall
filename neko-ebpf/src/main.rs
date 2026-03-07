@@ -18,6 +18,7 @@ use network_types::{
 };
 
 const CONNTRACK_TIMEOUT_NS: u64 = 300_000_000_000;
+
 #[map]
 static ALLOWED_IPS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 
@@ -54,25 +55,26 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
     let ethhdr: *const EthHdr = ptr_at(start, end, 0)?;
     match unsafe { (*ethhdr).ether_type } {
         EtherType::Ipv4 => {}
-        _ => return Ok(xdp_action::XDP_PASS), // Allow ARP, IPv6, etc.
+        _ => return Ok(xdp_action::XDP_PASS),
     }
 
     let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, EthHdr::LEN)?;
     let src_addr = unsafe { (*ipv4hdr).src_addr };
     let dst_addr = unsafe { (*ipv4hdr).dst_addr };
     let proto = unsafe { (*ipv4hdr).proto };
-
-    if matches!(proto, IpProto::Icmp) {
-        return Ok(xdp_action::XDP_PASS);
-    }
+    let proto_num = proto_to_num(proto);
 
     let src_host = u32::from_be(src_addr);
     if unsafe { ALLOWED_IPS.get(&src_host) }.is_some() {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // Extract ports for TCP/UDP
-    let (src_port, dst_port, raw_src_port, raw_dst_port) = match proto {
+    let proto_wildcard = (proto_num as u32) << 16;
+    if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let (src_port, dst_port, ct_src_port, ct_dst_port) = match proto {
         IpProto::Tcp => {
             let tcphdr: *const TcpHdr = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
             let raw_src = unsafe { (*tcphdr).source };
@@ -85,20 +87,26 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
             let raw_dst = unsafe { (*udphdr).dest };
             (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
         }
-        _ => return Ok(xdp_action::XDP_PASS), // Allow non-TCP/UDP
+        IpProto::Icmp => {
+            let icmp_type_ptr: *const u8 = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            let icmp_type = unsafe { *icmp_type_ptr };
+            (0u16, icmp_type as u16, 0u16, 0u16)
+        }
+        _ => return Ok(xdp_action::XDP_DROP),
     };
 
-    let proto_num = proto_to_num(proto);
-    let port_key = (proto_num as u32) << 16 | dst_port as u32;
-    if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
-        return Ok(xdp_action::XDP_PASS);
+    if dst_port > 0 {
+        let port_key = (proto_num as u32) << 16 | dst_port as u32;
+        if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
+            return Ok(xdp_action::XDP_PASS);
+        }
     }
 
     let ct_key = ConnTrackKey {
         src_ip: src_addr,
         dst_ip: dst_addr,
-        src_port: raw_src_port,
-        dst_port: raw_dst_port,
+        src_port: ct_src_port,
+        dst_port: ct_dst_port,
         proto: proto_num,
         _pad: [0; 3],
     };
@@ -119,7 +127,7 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
 pub fn neko_egress(ctx: TcContext) -> i32 {
     match try_neko_egress(&ctx) {
         Ok(action) => action,
-        Err(_) => 0, // TC_ACT_OK
+        Err(_) => 0,
     }
 }
 
@@ -134,8 +142,8 @@ fn try_neko_egress(ctx: &TcContext) -> Result<i32, ()> {
     }
 
     let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, EthHdr::LEN)?;
-    let src_addr = unsafe { (*ipv4hdr).src_addr }; // local IP
-    let dst_addr = unsafe { (*ipv4hdr).dst_addr }; // remote IP
+    let src_addr = unsafe { (*ipv4hdr).src_addr };
+    let dst_addr = unsafe { (*ipv4hdr).dst_addr };
     let proto = unsafe { (*ipv4hdr).proto };
 
     let (raw_src_port, raw_dst_port) = match proto {
@@ -147,14 +155,15 @@ fn try_neko_egress(ctx: &TcContext) -> Result<i32, ()> {
             let udphdr: *const UdpHdr = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
             (unsafe { (*udphdr).source }, unsafe { (*udphdr).dest })
         }
+        IpProto::Icmp => (0u16, 0u16),
         _ => return Ok(0),
     };
-    
+
     let ct_key = ConnTrackKey {
-        src_ip: dst_addr,       // remote IP → ingress src
-        dst_ip: src_addr,       // local IP  → ingress dst
-        src_port: raw_dst_port, // remote port → ingress src_port
-        dst_port: raw_src_port, // local port  → ingress dst_port
+        src_ip: dst_addr,
+        dst_ip: src_addr,
+        src_port: raw_dst_port,
+        dst_port: raw_src_port,
         proto: proto_to_num(proto),
         _pad: [0; 3],
     };
@@ -162,7 +171,7 @@ fn try_neko_egress(ctx: &TcContext) -> Result<i32, ()> {
     let now = unsafe { bpf_ktime_get_ns() };
     let _ = CONNTRACK.insert(&ct_key, &now, 0);
 
-    Ok(0) // TC_ACT_OK
+    Ok(0)
 }
 
 #[inline(always)]
@@ -170,6 +179,7 @@ fn proto_to_num(proto: IpProto) -> u8 {
     match proto {
         IpProto::Tcp => 6,
         IpProto::Udp => 17,
+        IpProto::Icmp => 1,
         _ => 0,
     }
 }

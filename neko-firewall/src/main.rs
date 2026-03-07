@@ -24,10 +24,6 @@ enum Commands {
         #[arg(short, long)]
         iface: String,
     },
-    Block {
-        #[command(subcommand)]
-        target: BlockTarget,
-    },
     Allow {
         #[command(subcommand)]
         target: AllowTarget,
@@ -45,12 +41,14 @@ enum Commands {
 enum AllowTarget {
     Ip { addr: Ipv4Addr },
     Port { proto: String, port: u16 },
+    Proto { proto: String },
 }
 
 #[derive(Subcommand)]
 enum BlockTarget {
     Ip { addr: Ipv4Addr },
     Port { proto: String, port: u16 },
+    Proto { proto: String },
 }
 
 fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
@@ -69,23 +67,24 @@ fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
                 for i in 0..events.read {
                     let ptr = buffers[i].as_ptr() as *const PacketLog;
                     let log = unsafe { ptr.read_unaligned() };
-                    let src = Ipv4Addr::from(log.src_addr.to_be());
-                    let dst = Ipv4Addr::from(log.dst_addr.to_be());
-                    let action = if log.action == 1 { "DROP" } else { "PASS" };
-                    let proto = match log.protocol {
-                        6 => "TCP",
-                        17 => "UDP",
-                        _ => "OTHER",
-                    };
-                    println!(
-                        "[{}] {} {}:{} -> {}:{}",
-                        action, proto, src, log.src_port, dst, log.dst_port,
-                    );
+                    print_packet_log(&log);
                 }
             }
         });
     }
     Ok(())
+}
+
+fn print_packet_log(log: &PacketLog) {
+    let src = Ipv4Addr::from(log.src_addr.to_be());
+    let dst = Ipv4Addr::from(log.dst_addr.to_be());
+    let action = if log.action == 1 { "DROP" } else { "PASS" };
+    match log.protocol {
+        1 => println!("[{}] ICMP {} -> {} (type {})", action, src, dst, log.dst_port),
+        6 => println!("[{}] TCP {}:{} -> {}:{}", action, src, log.src_port, dst, log.dst_port),
+        17 => println!("[{}] UDP {}:{} -> {}:{}", action, src, log.src_port, dst, log.dst_port),
+        p => println!("[{}] proto={} {}:{} -> {}:{}", action, p, src, log.src_port, dst, log.dst_port),
+    }
 }
 
 #[tokio::main]
@@ -97,10 +96,9 @@ async fn main() -> Result<()> {
         Commands::Run { iface } => {
             let mut ebpf = loader::load_and_attach(&iface)?;
             println!("Firewall running on {} (whitelist mode)", iface);
-            println!("  - All outbound: PASS");
-            println!("  - Established connections: PASS (via conntrack)");
-            println!("  - ICMP: PASS");
-            println!("  - New inbound: DROP (unless whitelisted)");
+            println!("  Default: DROP new inbound TCP/UDP/ICMP");
+            println!("  Established connections: PASS (conntrack)");
+            println!("  Use 'allow' to whitelist ports/protocols");
             println!("Press Ctrl+C to stop.");
             spawn_event_readers(&mut ebpf)?;
             signal::ctrl_c().await?;
@@ -114,7 +112,15 @@ async fn main() -> Result<()> {
             }
             AllowTarget::Port { proto, port } => {
                 rule::allow_port(&proto, port)?;
-                println!("Whitelisted port: {}/{}", port, proto);
+                if proto.eq_ignore_ascii_case("icmp") {
+                    println!("Whitelisted: icmp type {}", port);
+                } else {
+                    println!("Whitelisted: {}/{}", port, proto);
+                }
+            }
+            AllowTarget::Proto { proto } => {
+                rule::allow_proto(&proto)?;
+                println!("Whitelisted protocol: {}", proto);
             }
         },
         Commands::Block { target } => match target {
@@ -126,6 +132,10 @@ async fn main() -> Result<()> {
                 rule::block_port(&proto, port)?;
                 println!("Removed from whitelist: {}/{}", port, proto);
             }
+            BlockTarget::Proto { proto } => {
+                rule::block_proto(&proto)?;
+                println!("Removed protocol from whitelist: {}", proto);
+            }
         },
         Commands::List => {
             rule::list_rules()?;
@@ -135,7 +145,7 @@ async fn main() -> Result<()> {
         }
         Commands::Monitor => {
             let data = MapData::from_pin("/sys/fs/bpf/neko/EVENTS")
-                .map_err(|e| anyhow::anyhow!("Failed to open EVENTS: {} (is the firewall running?)", e))?;
+                .map_err(|e| anyhow::anyhow!("EVENTS: {} (is the firewall running?)", e))?;
             let map = Map::PerfEventArray(data);
             let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(map)?;
 
@@ -153,17 +163,7 @@ async fn main() -> Result<()> {
                         for i in 0..events.read {
                             let ptr = buffers[i].as_ptr() as *const PacketLog;
                             let log = unsafe { ptr.read_unaligned() };
-                            let src = Ipv4Addr::from(log.src_addr.to_be());
-                            let dst = Ipv4Addr::from(log.dst_addr.to_be());
-                            let proto = match log.protocol {
-                                6 => "TCP",
-                                17 => "UDP",
-                                _ => "OTHER",
-                            };
-                            println!(
-                                "[DROP] {} {}:{} -> {}:{}",
-                                proto, src, log.src_port, dst, log.dst_port,
-                            );
+                            print_packet_log(&log);
                         }
                     }
                 });
