@@ -123,8 +123,8 @@ pub fn list_rules() -> Result<()> {
         let mut count = 0u32;
         for res in map.iter() {
             let (key, _) = res.context("Failed to read entry")?;
-            let ip = Ipv4Addr::from(u32::from_be(key.data));
-            let prefix = key.prefix_len;
+            let ip = Ipv4Addr::from(u32::from_be(key.data()));
+            let prefix = key.prefix_len();
             if prefix == 32 {
                 println!("  ALLOW {}", ip);
             } else {

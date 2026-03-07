@@ -17,7 +17,7 @@ const EBPF_OBJ: &[u8] =
     include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
 const PIN_PATH: &str = "/sys/fs/bpf/neko";
 
-pub fn load(iface: &str) -> Result<Ebpf> {
+pub fn load(_iface: &str) -> Result<Ebpf> {
 
     std::fs::create_dir_all(PIN_PATH)
         .with_context(|| format!("Failed to create pin path {}", PIN_PATH))?;

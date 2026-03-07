@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use aya::maps::Array;
 use log::info;
 use neko_common::{
-    CompoundRule, ACTION_DROP, ACTION_PASS, MAX_COMPOUND_RULES,
+    CompoundRule, ACTION_PASS, MAX_COMPOUND_RULES,
     MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
 };
 use std::net::Ipv4Addr;
