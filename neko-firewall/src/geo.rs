@@ -98,24 +98,10 @@ pub fn set_country_policy(action: u32, code: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn remove_country_policy(code: &str) -> Result<()> {
-    let geo_id = country_to_id(code)?;
-    let mut map = open_geo_policy()?;
-    map.remove(&geo_id)?;
-    Ok(())
-}
-
 pub fn set_asn_policy(action: u32, asn: u32) -> Result<()> {
     let asn_id = 0x80000000 | asn;
     let mut map = open_geo_policy()?;
     map.insert(asn_id, action, 0)?;
-    Ok(())
-}
-
-pub fn remove_asn_policy(asn: u32) -> Result<()> {
-    let asn_id = 0x80000000 | asn;
-    let mut map = open_geo_policy()?;
-    map.remove(&asn_id)?;
     Ok(())
 }
 
