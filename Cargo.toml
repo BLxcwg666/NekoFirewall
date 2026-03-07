@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "neko-common",
+    "neko-firewall",
+    "xtask",
+]
+exclude = ["neko-ebpf"]
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+tokio = { version = "1", features = ["full"] }

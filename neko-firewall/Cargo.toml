@@ -1,0 +1,19 @@
+[package]
+name = "neko-firewall"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "neko-firewall"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+aya = "0.13"
+aya-log = "0.2"
+bytes = "1"
+clap = { workspace = true }
+env_logger = "0.11"
+log = { workspace = true }
+neko-common = { path = "../neko-common", features = ["user"] }
+tokio = { workspace = true }
