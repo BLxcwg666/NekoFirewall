@@ -4,7 +4,6 @@ mod rule;
 
 use anyhow::Result;
 use aya::maps::perf::AsyncPerfEventArray;
-use aya::maps::{Map, MapData};
 use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use log::info;
@@ -85,9 +84,18 @@ fn print_packet_log(log: &PacketLog) {
     let dst = Ipv4Addr::from(log.dst_addr.to_be());
     let action = if log.action == 1 { "DROP" } else { "PASS" };
     match log.protocol {
-        1 => println!("[{}] ICMP {} -> {} (type {})", action, src, dst, log.dst_port),
-        6 => println!("[{}] TCP {}:{} -> {}:{}", action, src, log.src_port, dst, log.dst_port),
-        17 => println!("[{}] UDP {}:{} -> {}:{}", action, src, log.src_port, dst, log.dst_port),
+        1 => println!(
+            "[{}] ICMP {} -> {} (type {})",
+            action, src, dst, log.dst_port
+        ),
+        6 => println!(
+            "[{}] TCP {}:{} -> {}:{}",
+            action, src, log.src_port, dst, log.dst_port
+        ),
+        17 => println!(
+            "[{}] UDP {}:{} -> {}:{}",
+            action, src, log.src_port, dst, log.dst_port
+        ),
         p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
     }
 }
@@ -100,11 +108,15 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Run { iface } => {
             let mut ebpf = loader::load_and_attach(&iface)?;
+            loader::reset_runtime_maps(&mut ebpf)?;
 
             println!("Loading GeoIP databases...");
             let geo_count = geo::load_geo_map(&mut ebpf)?;
             let asn_count = geo::load_asn_map(&mut ebpf)?;
-            println!("  Loaded {} country + {} ASN prefixes", geo_count, asn_count);
+            println!(
+                "  Loaded {} country + {} ASN prefixes",
+                geo_count, asn_count
+            );
 
             println!("Firewall running on {} (whitelist mode)", iface);
             println!("  Use 'allow/block country/asn' for geo filtering");
@@ -171,9 +183,7 @@ async fn main() -> Result<()> {
             rule::show_conntrack()?;
         }
         Commands::Monitor => {
-            let data = MapData::from_pin("/sys/fs/bpf/neko/EVENTS")
-                .map_err(|e| anyhow::anyhow!("EVENTS: {} (is the firewall running?)", e))?;
-            let map = Map::PerfEventArray(data);
+            let map = loader::open_pinned_perf_event_array("EVENTS")?;
             let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(map)?;
 
             println!("Monitoring dropped packets... (Ctrl+C to stop)");

@@ -10,24 +10,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build the eBPF program
     BuildEbpf {
-        /// Build in release mode
         #[arg(long, default_value_t = true)]
         release: bool,
     },
-    /// Build everything (eBPF + userspace)
     Build {
-        /// Build in release mode
         #[arg(long, default_value_t = true)]
         release: bool,
     },
-    /// Build and run the firewall
     Run {
-        /// Interface to attach to
         #[arg(short, long, default_value = "lo")]
         iface: String,
-        /// Extra arguments passed to neko-firewall
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -96,17 +89,10 @@ fn main() {
             build_userspace(true);
 
             let mut cmd = Command::new("sudo");
-            cmd.args([
-                "target/release/neko-firewall",
-                "run",
-                "-i",
-                &iface,
-            ]);
+            cmd.args(["target/release/neko-firewall", "run", "-i", &iface]);
             cmd.args(&args);
 
-            let status = cmd
-                .status()
-                .expect("Failed to run neko-firewall");
+            let status = cmd.status().expect("Failed to run neko-firewall");
 
             if !status.success() {
                 std::process::exit(1);

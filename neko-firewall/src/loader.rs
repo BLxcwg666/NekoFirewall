@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use aya::{
-    maps::{HashMap, Map, MapData},
-    pin::PinError,
+    maps::{
+        lpm_trie::{Key, LpmTrie},
+        HashMap, Map, MapData, MapInfo, MapType,
+    },
     programs::{
         tc::{self, SchedClassifier, TcAttachType},
         Xdp, XdpFlags,
     },
-    Ebpf,
+    Ebpf, EbpfLoader, Pod,
 };
 use log::info;
+use neko_common::ConnTrackKey;
 use std::path::Path;
 
 const EBPF_OBJ_PATH: &str = "target/bpfel-unknown-none/release/neko-ebpf";
@@ -19,7 +22,13 @@ pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
     let data = std::fs::read(path)
         .with_context(|| format!("Failed to read eBPF object at {}", path.display()))?;
 
-    let mut ebpf = Ebpf::load(&data).context("Failed to load eBPF program")?;
+    std::fs::create_dir_all(PIN_PATH)
+        .with_context(|| format!("Failed to create pin path {}", PIN_PATH))?;
+
+    let mut ebpf = EbpfLoader::new()
+        .map_pin_path(PIN_PATH)
+        .load(&data)
+        .context("Failed to load eBPF program")?;
 
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
         log::warn!("Failed to init eBPF logger: {}", e);
@@ -49,36 +58,105 @@ pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
         .with_context(|| format!("Failed to attach TC egress to {}", iface))?;
     info!("TC egress program attached to {} (conntrack)", iface);
 
-    std::fs::create_dir_all(PIN_PATH).ok();
-    for name in ["ALLOWED_IPS", "ALLOWED_PORTS", "CONNTRACK", "EVENTS", "GEO_MAP", "GEO_POLICY"] {
-        if let Some(map) = ebpf.map_mut(name) {
-            let pin = format!("{}/{}", PIN_PATH, name);
-            match map.pin(&pin) {
-                Ok(()) => info!("Pinned map {}", name),
-                Err(PinError::SyscallError(_)) => {
-                    info!("Map {} pin skipped (may already exist)", name);
-                }
-                Err(e) => log::warn!("Failed to pin map {}: {}", name, e),
-            }
-        }
-    }
-
     Ok(ebpf)
 }
 
+pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
+    clear_hash_map::<ConnTrackKey, u64>(ebpf, "CONNTRACK")?;
+    clear_lpm_trie::<u32, u32>(ebpf, "GEO_COUNTRY_MAP")?;
+    clear_lpm_trie::<u32, u32>(ebpf, "GEO_ASN_MAP")?;
+    Ok(())
+}
+
 pub fn cleanup_pins() {
-    for name in ["ALLOWED_IPS", "ALLOWED_PORTS", "CONNTRACK", "EVENTS", "GEO_MAP", "GEO_POLICY"] {
+    for name in [
+        "ALLOWED_IPS",
+        "ALLOWED_PORTS",
+        "CONNTRACK",
+        "EVENTS",
+        "GEO_COUNTRY_MAP",
+        "GEO_ASN_MAP",
+        "GEO_POLICY",
+        "GEO_MAP",
+    ] {
         let pin = format!("{}/{}", PIN_PATH, name);
         std::fs::remove_file(&pin).ok();
     }
     std::fs::remove_dir(PIN_PATH).ok();
 }
 
-pub fn open_pinned_hashmap(name: &str) -> Result<HashMap<MapData, u32, u32>> {
+pub fn open_pinned_hashmap<K: Pod, V: Pod>(name: &str) -> Result<HashMap<MapData, K, V>> {
+    let map = open_pinned_map(name)?;
+    HashMap::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open {} as HashMap: {:?}", name, e))
+}
+
+pub fn open_pinned_perf_event_array(name: &str) -> Result<Map> {
+    let map = open_pinned_map(name)?;
+    match map {
+        Map::PerfEventArray(_) => Ok(map),
+        other => Err(anyhow::anyhow!(
+            "Failed to open {} as PerfEventArray: actual type {:?}",
+            name,
+            other
+        )),
+    }
+}
+
+fn open_pinned_map(name: &str) -> Result<Map> {
     let pin = format!("{}/{}", PIN_PATH, name);
     let data = MapData::from_pin(&pin)
         .map_err(|e| anyhow::anyhow!("Failed to open {}: {} (is the firewall running?)", pin, e))?;
-    let map = Map::HashMap(data);
-    HashMap::try_from(map)
-        .map_err(|e| anyhow::anyhow!("Failed to open {} as HashMap: {:?}", name, e))
+    let info =
+        MapInfo::from_pin(&pin).map_err(|e| anyhow::anyhow!("Failed to inspect {}: {}", pin, e))?;
+    let map = match info.map_type()? {
+        MapType::Hash => Map::HashMap(data),
+        MapType::LruHash => Map::LruHashMap(data),
+        MapType::LpmTrie => Map::LpmTrie(data),
+        MapType::PerfEventArray => Map::PerfEventArray(data),
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unsupported pinned map type {:?} for {}",
+                other,
+                name
+            ));
+        }
+    };
+    Ok(map)
+}
+
+fn clear_hash_map<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+    let map = ebpf
+        .map_mut(name)
+        .with_context(|| format!("{} map not found", name))?;
+    let mut typed: HashMap<_, K, V> = HashMap::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open {} as HashMap: {:?}", name, e))?;
+    let keys = typed
+        .keys()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("Failed to enumerate {}", name))?;
+    for key in keys {
+        typed
+            .remove(&key)
+            .with_context(|| format!("Failed to clear {}", name))?;
+    }
+    Ok(())
+}
+
+fn clear_lpm_trie<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+    let map = ebpf
+        .map_mut(name)
+        .with_context(|| format!("{} map not found", name))?;
+    let mut typed: LpmTrie<_, K, V> = LpmTrie::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open {} as LpmTrie: {:?}", name, e))?;
+    let keys = typed
+        .keys()
+        .collect::<std::result::Result<Vec<Key<K>>, _>>()
+        .with_context(|| format!("Failed to enumerate {}", name))?;
+    for key in keys {
+        typed
+            .remove(&key)
+            .with_context(|| format!("Failed to clear {}", name))?;
+    }
+    Ok(())
 }

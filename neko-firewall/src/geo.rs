@@ -1,14 +1,20 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use aya::maps::lpm_trie::{Key, LpmTrie};
-use aya::maps::{Map, MapData};
 use ipnetwork::IpNetwork;
 use log::info;
 use maxminddb::geoip2;
 
+use crate::loader;
+
 const COUNTRY_MMDB: &[u8] = include_bytes!("../resources/GeoLite2-Country.mmdb");
 const ASN_MMDB: &[u8] = include_bytes!("../resources/GeoLite2-ASN.mmdb");
 
-pub fn country_to_id(code: &str) -> u32 {
+pub fn country_to_id(code: &str) -> Result<u32> {
+    let code = normalize_country_code(code)?;
+    Ok(country_to_id_unchecked(&code))
+}
+
+fn country_to_id_unchecked(code: &str) -> u32 {
     let b = code.as_bytes();
     (b[0] as u32) << 8 | b[1] as u32
 }
@@ -23,9 +29,11 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
     let reader = maxminddb::Reader::from_source(COUNTRY_MMDB.to_vec())
         .context("Failed to load embedded Country mmdb")?;
 
-    let map = ebpf.map_mut("GEO_MAP").context("GEO_MAP not found")?;
+    let map = ebpf
+        .map_mut("GEO_COUNTRY_MAP")
+        .context("GEO_COUNTRY_MAP not found")?;
     let mut trie: LpmTrie<_, u32, u32> =
-        LpmTrie::try_from(map).context("Failed to open GEO_MAP")?;
+        LpmTrie::try_from(map).context("Failed to open GEO_COUNTRY_MAP")?;
 
     let mut count = 0usize;
 
@@ -38,7 +46,7 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
                     let prefix_len = net.prefix() as u32;
                     let ip_be = u32::from(net.ip()).to_be();
                     let key = Key::new(prefix_len, ip_be);
-                    let geo_id = country_to_id(iso_code);
+                    let geo_id = country_to_id(iso_code)?;
                     let _ = trie.insert(&key, geo_id, 0);
                     count += 1;
                 }
@@ -46,7 +54,7 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
         }
     }
 
-    info!("Loaded {} country prefixes into GEO_MAP", count);
+    info!("Loaded {} country prefixes into GEO_COUNTRY_MAP", count);
     Ok(count)
 }
 
@@ -54,9 +62,11 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
     let reader = maxminddb::Reader::from_source(ASN_MMDB.to_vec())
         .context("Failed to load embedded ASN mmdb")?;
 
-    let map = ebpf.map_mut("GEO_MAP").context("GEO_MAP not found")?;
+    let map = ebpf
+        .map_mut("GEO_ASN_MAP")
+        .context("GEO_ASN_MAP not found")?;
     let mut trie: LpmTrie<_, u32, u32> =
-        LpmTrie::try_from(map).context("Failed to open GEO_MAP")?;
+        LpmTrie::try_from(map).context("Failed to open GEO_ASN_MAP")?;
 
     let mut count = 0usize;
 
@@ -77,19 +87,19 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
         }
     }
 
-    info!("Loaded {} ASN prefixes into GEO_MAP", count);
+    info!("Loaded {} ASN prefixes into GEO_ASN_MAP", count);
     Ok(count)
 }
 
 pub fn set_country_policy(action: u32, code: &str) -> Result<()> {
-    let geo_id = country_to_id(&code.to_uppercase());
+    let geo_id = country_to_id(code)?;
     let mut map = open_geo_policy()?;
     map.insert(geo_id, action, 0)?;
     Ok(())
 }
 
 pub fn remove_country_policy(code: &str) -> Result<()> {
-    let geo_id = country_to_id(&code.to_uppercase());
+    let geo_id = country_to_id(code)?;
     let mut map = open_geo_policy()?;
     map.remove(&geo_id)?;
     Ok(())
@@ -128,11 +138,16 @@ pub fn list_policies() -> Result<()> {
     Ok(())
 }
 
-fn open_geo_policy() -> Result<aya::maps::HashMap<MapData, u32, u32>> {
-    let pin = "/sys/fs/bpf/neko/GEO_POLICY";
-    let data = MapData::from_pin(pin)
-        .map_err(|e| anyhow::anyhow!("GEO_POLICY: {} (is the firewall running?)", e))?;
-    let map = Map::HashMap(data);
-    aya::maps::HashMap::try_from(map)
-        .map_err(|e| anyhow::anyhow!("Failed to open GEO_POLICY: {:?}", e))
+fn open_geo_policy() -> Result<aya::maps::HashMap<aya::maps::MapData, u32, u32>> {
+    loader::open_pinned_hashmap("GEO_POLICY")
+}
+
+fn normalize_country_code(code: &str) -> Result<String> {
+    let code = code.trim();
+    ensure!(
+        code.len() == 2 && code.is_ascii() && code.bytes().all(|b| b.is_ascii_alphabetic()),
+        "Invalid country code: {} (expected ISO 3166-1 alpha-2 like US or CN)",
+        code
+    );
+    Ok(code.to_ascii_uppercase())
 }
