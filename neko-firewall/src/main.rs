@@ -11,6 +11,11 @@ use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
 use std::net::Ipv4Addr;
 use tokio::signal;
 
+fn set_title(title: &str) {
+    // OSC escape: \x1b]2;TITLE\x07
+    eprint!("\x1b]2;{}\x07", title);
+}
+
 #[derive(Parser)]
 #[command(name = "neko-firewall", about = "XDP/eBPF whitelist firewall")]
 struct Cli {
@@ -103,6 +108,10 @@ fn print_packet_log(log: &PacketLog) {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+    set_title(&format!(
+        "NekoFirewall v{}",
+        env!("CARGO_PKG_VERSION")
+    ));
     let cli = Cli::parse();
 
     match cli.command {
@@ -118,6 +127,7 @@ async fn main() -> Result<()> {
                 geo_count, asn_count
             );
 
+            set_title(&format!("NekoFirewall | {} · whitelist", iface));
             println!("Firewall running on {} (whitelist mode)", iface);
             println!("  Use 'allow/block country/asn' for geo filtering");
             println!("Press Ctrl+C to stop.");
@@ -186,6 +196,7 @@ async fn main() -> Result<()> {
             let map = loader::open_pinned_perf_event_array("EVENTS")?;
             let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(map)?;
 
+            set_title("NekoFirewall | monitoring");
             println!("Monitoring dropped packets... (Ctrl+C to stop)");
 
             let cpus = aya::util::online_cpus().unwrap();
