@@ -1,0 +1,23 @@
+[Unit]
+Description=NekoFirewall - A XDP/eBPF Firewall
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nf run -i %i
+ExecStopPost=/bin/rm -rf /sys/fs/bpf/neko
+
+Restart=on-failure
+RestartSec=5
+
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/sys/fs/bpf
+NoNewPrivileges=false
+
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_BPF
+
+[Install]
+WantedBy=multi-user.target
