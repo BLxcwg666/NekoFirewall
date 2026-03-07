@@ -12,22 +12,18 @@ use aya::{
 };
 use log::info;
 use neko_common::ConnTrackKey;
-use std::path::Path;
-
-const EBPF_OBJ_PATH: &str = "target/bpfel-unknown-none/release/neko-ebpf";
+const EBPF_OBJ: &[u8] =
+    include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
 const PIN_PATH: &str = "/sys/fs/bpf/neko";
 
 pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
-    let path = Path::new(EBPF_OBJ_PATH);
-    let data = std::fs::read(path)
-        .with_context(|| format!("Failed to read eBPF object at {}", path.display()))?;
 
     std::fs::create_dir_all(PIN_PATH)
         .with_context(|| format!("Failed to create pin path {}", PIN_PATH))?;
 
     let mut ebpf = EbpfLoader::new()
         .map_pin_path(PIN_PATH)
-        .load(&data)
+        .load(EBPF_OBJ)
         .context("Failed to load eBPF program")?;
 
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
