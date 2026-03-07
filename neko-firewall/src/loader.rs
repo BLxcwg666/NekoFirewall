@@ -89,6 +89,12 @@ pub fn open_pinned_hashmap<K: Pod, V: Pod>(name: &str) -> Result<HashMap<MapData
         .map_err(|e| anyhow::anyhow!("Failed to open {} as HashMap: {:?}", name, e))
 }
 
+pub fn open_pinned_lpm_trie<K: Pod, V: Pod>(name: &str) -> Result<LpmTrie<MapData, K, V>> {
+    let map = open_pinned_map(name)?;
+    LpmTrie::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open {} as LpmTrie: {:?}", name, e))
+}
+
 pub fn open_pinned_perf_event_array(name: &str) -> Result<Map> {
     let map = open_pinned_map(name)?;
     match map {

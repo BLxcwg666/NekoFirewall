@@ -1,14 +1,13 @@
 use anyhow::{Context, Result};
-use aya::maps::{Array, HashMap};
+use aya::maps::{lpm_trie::Key, Array, HashMap};
 use neko_common::{
     CompoundRule, ACTION_DROP, ACTION_PASS, MAX_COMPOUND_RULES,
     MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
 };
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
 use std::path::Path;
 
-use crate::{geo, loader};
+use crate::{geo, loader, rule};
 
 const CONFIG_DIR: &str = "/etc/neko-firewall";
 const CONFIG_PATH: &str = "/etc/neko-firewall/rules.toml";
@@ -80,15 +79,15 @@ impl Config {
     }
 
     pub fn apply(&self) -> Result<()> {
-        // Apply IP rules
+        // Apply IP rules (LpmTrie/CIDR)
         if !self.allow.ips.is_empty() {
-            let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_IPS")?;
-            for ip_str in &self.allow.ips {
-                if let Ok(addr) = ip_str.parse::<Ipv4Addr>() {
-                    let ip: u32 = addr.into();
-                    map.insert(ip, ACTION_PASS, 0)?;
+            let mut map = loader::open_pinned_lpm_trie::<u32, u32>("ALLOWED_IPS")?;
+            for cidr in &self.allow.ips {
+                if let Ok((ip, prefix)) = rule::parse_cidr(cidr) {
+                    let key = Key::new(prefix as u32, u32::from(ip).to_be());
+                    map.insert(&key, ACTION_PASS, 0)?;
                 } else {
-                    eprintln!("  Warning: skipping invalid IP '{}'", ip_str);
+                    eprintln!("  Warning: skipping invalid IP/CIDR '{}'", cidr);
                 }
             }
         }
@@ -180,15 +179,15 @@ impl Config {
             + self.rules.len()
     }
 
-    pub fn add_ip(&mut self, addr: Ipv4Addr) {
-        let s = addr.to_string();
+    pub fn add_ip(&mut self, cidr: &str) {
+        let s = cidr.to_string();
         if !self.allow.ips.contains(&s) {
             self.allow.ips.push(s);
         }
     }
 
-    pub fn remove_ip(&mut self, addr: Ipv4Addr) {
-        let s = addr.to_string();
+    pub fn remove_ip(&mut self, cidr: &str) {
+        let s = cidr.to_string();
         self.allow.ips.retain(|x| x != &s);
     }
 
@@ -256,7 +255,7 @@ impl CompoundRuleEntry {
         port: Option<u16>,
         country: Option<&str>,
         asn: Option<u32>,
-        ip: Option<Ipv4Addr>,
+        ip: Option<&str>,
     ) -> Self {
         Self {
             action: if action == ACTION_PASS {
@@ -268,7 +267,7 @@ impl CompoundRuleEntry {
             port,
             country: country.map(|c| c.to_uppercase()),
             asn,
-            ip: ip.map(|a| a.to_string()),
+            ip: ip.map(|s| s.to_string()),
         }
     }
 
@@ -282,7 +281,7 @@ impl CompoundRuleEntry {
             match_fields: 0,
             action,
             proto: 0,
-            _pad: [0],
+            prefix_len: 0,
             port: 0,
             country_id: 0,
             asn_id: 0,
@@ -305,8 +304,9 @@ impl CompoundRuleEntry {
             rule.match_fields |= MATCH_ASN;
         }
         if let Some(ref ip_str) = self.ip {
-            let addr: Ipv4Addr = ip_str.parse().ok()?;
+            let (addr, prefix) = rule::parse_cidr(ip_str).ok()?;
             rule.src_ip = u32::from(addr).to_be();
+            rule.prefix_len = prefix;
             rule.match_fields |= MATCH_IP;
         }
         Some(rule)

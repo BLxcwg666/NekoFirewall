@@ -50,7 +50,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AllowTarget {
-    Ip { addr: Ipv4Addr },
+    Ip { addr: String },
     Port { proto: String, port: u16 },
     Proto { proto: String },
     Country { code: String },
@@ -59,7 +59,7 @@ enum AllowTarget {
 
 #[derive(Subcommand)]
 enum BlockTarget {
-    Ip { addr: Ipv4Addr },
+    Ip { addr: String },
     Port { proto: String, port: u16 },
     Proto { proto: String },
     Country { code: String },
@@ -79,7 +79,7 @@ enum RuleAction {
         #[arg(long)]
         asn: Option<u32>,
         #[arg(long)]
-        ip: Option<Ipv4Addr>,
+        ip: Option<String>,
     },
     Remove {
         index: u32,
@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
         }
         Commands::Allow { target } => match target {
             AllowTarget::Ip { addr } => {
-                rule::allow_ip(addr)?;
+                rule::allow_ip(&addr)?;
                 println!("Whitelisted IP: {}", addr);
             }
             AllowTarget::Port { proto, port } => {
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
         },
         Commands::Block { target } => match target {
             BlockTarget::Ip { addr } => {
-                rule::block_ip(addr)?;
+                rule::block_ip(&addr)?;
                 println!("Removed from whitelist: {}", addr);
             }
             BlockTarget::Port { proto, port } => {
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
                     port,
                     country.as_deref(),
                     asn,
-                    ip,
+                    ip.as_deref(),
                 )?;
                 println!("Added compound rule [{}]", idx);
             }

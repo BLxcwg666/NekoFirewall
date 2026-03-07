@@ -7,7 +7,7 @@ use neko_common::{
 };
 use std::net::Ipv4Addr;
 
-use crate::{config::{CompoundRuleEntry, Config}, geo, loader};
+use crate::{config::{CompoundRuleEntry, Config}, geo, loader, rule};
 
 pub fn add_rule(
     action: u32,
@@ -15,13 +15,13 @@ pub fn add_rule(
     port: Option<u16>,
     country: Option<&str>,
     asn: Option<u32>,
-    ip: Option<Ipv4Addr>,
+    ip: Option<&str>,
 ) -> Result<u32> {
-    let mut rule = CompoundRule {
+    let mut bpf_rule = CompoundRule {
         match_fields: 0,
         action,
         proto: 0,
-        _pad: [0],
+        prefix_len: 0,
         port: 0,
         country_id: 0,
         asn_id: 0,
@@ -29,27 +29,29 @@ pub fn add_rule(
     };
 
     if let Some(p) = proto {
-        rule.proto = parse_proto(p)?;
-        rule.match_fields |= MATCH_PROTO;
+        bpf_rule.proto = parse_proto(p)?;
+        bpf_rule.match_fields |= MATCH_PROTO;
     }
     if let Some(p) = port {
-        rule.port = p;
-        rule.match_fields |= MATCH_PORT;
+        bpf_rule.port = p;
+        bpf_rule.match_fields |= MATCH_PORT;
     }
     if let Some(c) = country {
-        rule.country_id = geo::country_to_id(c)?;
-        rule.match_fields |= MATCH_COUNTRY;
+        bpf_rule.country_id = geo::country_to_id(c)?;
+        bpf_rule.match_fields |= MATCH_COUNTRY;
     }
     if let Some(a) = asn {
-        rule.asn_id = 0x80000000 | a;
-        rule.match_fields |= MATCH_ASN;
+        bpf_rule.asn_id = 0x80000000 | a;
+        bpf_rule.match_fields |= MATCH_ASN;
     }
-    if let Some(addr) = ip {
-        rule.src_ip = u32::from(addr).to_be();
-        rule.match_fields |= MATCH_IP;
+    if let Some(cidr) = ip {
+        let (addr, prefix) = rule::parse_cidr(cidr)?;
+        bpf_rule.src_ip = u32::from(addr).to_be();
+        bpf_rule.prefix_len = prefix;
+        bpf_rule.match_fields |= MATCH_IP;
     }
 
-    if rule.match_fields == 0 {
+    if bpf_rule.match_fields == 0 {
         bail!("At least one condition is required (--proto, --port, --country, --asn, --ip)");
     }
 
@@ -57,7 +59,7 @@ pub fn add_rule(
     for i in 0..MAX_COMPOUND_RULES {
         let existing = map.get(&i, 0).context("Failed to read RULES slot")?;
         if existing.match_fields == 0 {
-            map.set(i, rule, 0)
+            map.set(i, bpf_rule, 0)
                 .map_err(|e| anyhow::anyhow!("Failed to insert rule: {:?}", e))?;
             info!("Added compound rule at slot {}", i);
 
@@ -75,18 +77,8 @@ pub fn remove_rule(index: u32) -> Result<()> {
     if index >= MAX_COMPOUND_RULES {
         bail!("Index out of range (max {})", MAX_COMPOUND_RULES - 1);
     }
-    let empty = CompoundRule {
-        match_fields: 0,
-        action: 0,
-        proto: 0,
-        _pad: [0],
-        port: 0,
-        country_id: 0,
-        asn_id: 0,
-        src_ip: 0,
-    };
     let mut map = open_rules_array()?;
-    map.set(index, empty, 0)
+    map.set(index, CompoundRule::default(), 0)
         .map_err(|e| anyhow::anyhow!("Failed to clear rule slot {}: {:?}", index, e))?;
 
     let mut cfg = Config::load()?;
@@ -123,10 +115,12 @@ pub fn list_rules() -> Result<()> {
             parts.push(format!("asn={}", rule.asn_id & 0x7FFFFFFF));
         }
         if rule.match_fields & MATCH_IP != 0 {
-            parts.push(format!(
-                "ip={}",
-                Ipv4Addr::from(u32::from_be(rule.src_ip))
-            ));
+            let ip = Ipv4Addr::from(u32::from_be(rule.src_ip));
+            if rule.prefix_len < 32 {
+                parts.push(format!("ip={}/{}", ip, rule.prefix_len));
+            } else {
+                parts.push(format!("ip={}", ip));
+            }
         }
         println!("  [{}] {} {}", i, action_str, parts.join(" "));
         count += 1;

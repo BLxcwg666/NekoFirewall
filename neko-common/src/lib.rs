@@ -46,7 +46,7 @@ pub struct CompoundRule {
     pub match_fields: u32,
     pub action: u32,
     pub proto: u8,
-    pub _pad: [u8; 1],
+    pub prefix_len: u8,
     pub port: u16,
     pub country_id: u32,
     pub asn_id: u32,

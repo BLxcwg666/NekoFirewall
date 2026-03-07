@@ -25,7 +25,7 @@ use network_types::{
 const CONNTRACK_TIMEOUT_NS: u64 = 300_000_000_000;
 
 #[map]
-static ALLOWED_IPS: HashMap<u32, u32> = HashMap::pinned(1024, 0);
+static ALLOWED_IPS: LpmTrie<u32, u32> = LpmTrie::pinned(65536, 0);
 
 #[map]
 static ALLOWED_PORTS: HashMap<u32, u32> = HashMap::pinned(1024, 0);
@@ -93,8 +93,9 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
     let transport_offset = EthHdr::LEN + ipv4_header_len(ipv4hdr)?;
     let proto_num = proto_to_num(proto);
 
-    let src_host = u32::from_be(src_addr);
-    if unsafe { ALLOWED_IPS.get(&src_host) }.is_some() {
+    // --- IP whitelist (LPM/CIDR) ---
+    let ip_key = Key::new(32, src_addr);
+    if ALLOWED_IPS.get(&ip_key).is_some() {
         return Ok(xdp_action::XDP_PASS);
     }
 
@@ -142,8 +143,19 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
             if mf & MATCH_ASN != 0 && rule.asn_id != asn_id {
                 matched = false;
             }
-            if mf & MATCH_IP != 0 && rule.src_ip != src_addr {
-                matched = false;
+            if mf & MATCH_IP != 0 {
+                let pl = rule.prefix_len;
+                if pl > 0 && pl <= 32 {
+                    let mask = if pl >= 32 {
+                        !0u32
+                    } else {
+                        !0u32 << (32 - pl as u32)
+                    };
+                    let mask_be = mask.to_be();
+                    if (src_addr & mask_be) != (rule.src_ip & mask_be) {
+                        matched = false;
+                    }
+                }
             }
             if matched {
                 if rule.action == ACTION_DROP {
