@@ -1,3 +1,4 @@
+mod geo;
 mod loader;
 mod rule;
 
@@ -7,7 +8,7 @@ use aya::maps::{Map, MapData};
 use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use log::info;
-use neko_common::PacketLog;
+use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
 use std::net::Ipv4Addr;
 use tokio::signal;
 
@@ -42,6 +43,8 @@ enum AllowTarget {
     Ip { addr: Ipv4Addr },
     Port { proto: String, port: u16 },
     Proto { proto: String },
+    Country { code: String },
+    Asn { asn: u32 },
 }
 
 #[derive(Subcommand)]
@@ -49,6 +52,8 @@ enum BlockTarget {
     Ip { addr: Ipv4Addr },
     Port { proto: String, port: u16 },
     Proto { proto: String },
+    Country { code: String },
+    Asn { asn: u32 },
 }
 
 fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
@@ -83,7 +88,7 @@ fn print_packet_log(log: &PacketLog) {
         1 => println!("[{}] ICMP {} -> {} (type {})", action, src, dst, log.dst_port),
         6 => println!("[{}] TCP {}:{} -> {}:{}", action, src, log.src_port, dst, log.dst_port),
         17 => println!("[{}] UDP {}:{} -> {}:{}", action, src, log.src_port, dst, log.dst_port),
-        p => println!("[{}] proto={} {}:{} -> {}:{}", action, p, src, log.src_port, dst, log.dst_port),
+        p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
     }
 }
 
@@ -95,10 +100,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Run { iface } => {
             let mut ebpf = loader::load_and_attach(&iface)?;
+
+            println!("Loading GeoIP databases...");
+            let geo_count = geo::load_geo_map(&mut ebpf)?;
+            let asn_count = geo::load_asn_map(&mut ebpf)?;
+            println!("  Loaded {} country + {} ASN prefixes", geo_count, asn_count);
+
             println!("Firewall running on {} (whitelist mode)", iface);
-            println!("  Default: DROP new inbound TCP/UDP/ICMP");
-            println!("  Established connections: PASS (conntrack)");
-            println!("  Use 'allow' to whitelist ports/protocols");
+            println!("  Use 'allow/block country/asn' for geo filtering");
             println!("Press Ctrl+C to stop.");
             spawn_event_readers(&mut ebpf)?;
             signal::ctrl_c().await?;
@@ -122,6 +131,14 @@ async fn main() -> Result<()> {
                 rule::allow_proto(&proto)?;
                 println!("Whitelisted protocol: {}", proto);
             }
+            AllowTarget::Country { code } => {
+                geo::set_country_policy(ACTION_PASS, &code)?;
+                println!("Allowed country: {}", code.to_uppercase());
+            }
+            AllowTarget::Asn { asn } => {
+                geo::set_asn_policy(ACTION_PASS, asn)?;
+                println!("Allowed ASN: {}", asn);
+            }
         },
         Commands::Block { target } => match target {
             BlockTarget::Ip { addr } => {
@@ -136,9 +153,19 @@ async fn main() -> Result<()> {
                 rule::block_proto(&proto)?;
                 println!("Removed protocol from whitelist: {}", proto);
             }
+            BlockTarget::Country { code } => {
+                geo::set_country_policy(ACTION_DROP, &code)?;
+                println!("Blocked country: {}", code.to_uppercase());
+            }
+            BlockTarget::Asn { asn } => {
+                geo::set_asn_policy(ACTION_DROP, asn)?;
+                println!("Blocked ASN: {}", asn);
+            }
         },
         Commands::List => {
             rule::list_rules()?;
+            println!("\n=== Geo/ASN Policies ===");
+            geo::list_policies()?;
         }
         Commands::Conntrack => {
             rule::show_conntrack()?;

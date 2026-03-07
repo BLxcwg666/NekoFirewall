@@ -5,11 +5,12 @@ use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{classifier, map, xdp},
-    maps::{HashMap, PerfEventArray},
+    maps::{HashMap, LpmTrie, PerfEventArray},
     programs::{TcContext, XdpContext},
 };
+use aya_ebpf::maps::lpm_trie::Key;
 use core::mem;
-use neko_common::{ConnTrackKey, PacketLog, ACTION_DROP};
+use neko_common::{ConnTrackKey, PacketLog, ACTION_DROP, ACTION_PASS};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -30,6 +31,12 @@ static CONNTRACK: HashMap<ConnTrackKey, u64> = HashMap::with_max_entries(65536, 
 
 #[map]
 static EVENTS: PerfEventArray<PacketLog> = PerfEventArray::new(0);
+
+#[map]
+static GEO_MAP: LpmTrie<u32, u32> = LpmTrie::with_max_entries(524288, 0);
+
+#[map]
+static GEO_POLICY: HashMap<u32, u32> = HashMap::with_max_entries(512, 0);
 
 #[xdp]
 pub fn neko_firewall(ctx: XdpContext) -> u32 {
@@ -67,6 +74,19 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
     let src_host = u32::from_be(src_addr);
     if unsafe { ALLOWED_IPS.get(&src_host) }.is_some() {
         return Ok(xdp_action::XDP_PASS);
+    }
+
+    let geo_key = Key::new(32, src_addr);
+    if let Some(&geo_id) = unsafe { GEO_MAP.get(&geo_key) } {
+        if let Some(&action) = unsafe { GEO_POLICY.get(&geo_id) } {
+            if action == ACTION_DROP {
+                log_event(ctx, src_addr, dst_addr, 0, 0, proto_num, ACTION_DROP as u8);
+                return Ok(xdp_action::XDP_DROP);
+            }
+            if action == ACTION_PASS {
+                return Ok(xdp_action::XDP_PASS);
+            }
+        }
     }
 
     let proto_wildcard = (proto_num as u32) << 16;

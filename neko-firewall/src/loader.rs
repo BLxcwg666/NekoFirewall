@@ -50,7 +50,7 @@ pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
     info!("TC egress program attached to {} (conntrack)", iface);
 
     std::fs::create_dir_all(PIN_PATH).ok();
-    for name in ["ALLOWED_IPS", "ALLOWED_PORTS", "CONNTRACK", "EVENTS"] {
+    for name in ["ALLOWED_IPS", "ALLOWED_PORTS", "CONNTRACK", "EVENTS", "GEO_MAP", "GEO_POLICY"] {
         if let Some(map) = ebpf.map_mut(name) {
             let pin = format!("{}/{}", PIN_PATH, name);
             match map.pin(&pin) {
@@ -67,7 +67,7 @@ pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
 }
 
 pub fn cleanup_pins() {
-    for name in ["ALLOWED_IPS", "ALLOWED_PORTS", "CONNTRACK", "EVENTS"] {
+    for name in ["ALLOWED_IPS", "ALLOWED_PORTS", "CONNTRACK", "EVENTS", "GEO_MAP", "GEO_POLICY"] {
         let pin = format!("{}/{}", PIN_PATH, name);
         std::fs::remove_file(&pin).ok();
     }
