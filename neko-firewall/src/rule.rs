@@ -1,57 +1,48 @@
 use anyhow::{bail, Context, Result};
-use aya::{maps::HashMap, Ebpf};
 use log::info;
 use neko_common::ACTION_DROP;
 use std::net::Ipv4Addr;
 
-pub fn block_ip(ebpf: &mut Ebpf, addr: Ipv4Addr) -> Result<()> {
-    let map = ebpf.map_mut("BLOCKLIST").context("BLOCKLIST map not found")?;
-    let mut blocklist: HashMap<_, u32, u32> =
-        HashMap::try_from(map).context("Failed to open BLOCKLIST")?;
+use crate::loader;
+
+pub fn block_ip(addr: Ipv4Addr) -> Result<()> {
+    let mut blocklist = loader::open_pinned_map("BLOCKLIST")?;
     let ip: u32 = addr.into();
     blocklist.insert(ip, ACTION_DROP, 0)?;
     info!("Blocked IP: {}", addr);
     Ok(())
 }
 
-pub fn allow_ip(ebpf: &mut Ebpf, addr: Ipv4Addr) -> Result<()> {
-    let map = ebpf.map_mut("BLOCKLIST").context("BLOCKLIST map not found")?;
-    let mut blocklist: HashMap<_, u32, u32> =
-        HashMap::try_from(map).context("Failed to open BLOCKLIST")?;
+pub fn allow_ip(addr: Ipv4Addr) -> Result<()> {
+    let mut blocklist = loader::open_pinned_map("BLOCKLIST")?;
     let ip: u32 = addr.into();
     blocklist.remove(&ip)?;
     info!("Allowed IP: {}", addr);
     Ok(())
 }
 
-pub fn block_port(ebpf: &mut Ebpf, proto: &str, port: u16) -> Result<()> {
+pub fn block_port(proto: &str, port: u16) -> Result<()> {
     let proto_num = parse_proto(proto)?;
     let key = (proto_num as u32) << 16 | port as u32;
-    let map = ebpf.map_mut("PORT_RULES").context("PORT_RULES map not found")?;
-    let mut port_rules: HashMap<_, u32, u32> =
-        HashMap::try_from(map).context("Failed to open PORT_RULES")?;
+    let mut port_rules = loader::open_pinned_map("PORT_RULES")?;
     port_rules.insert(key, ACTION_DROP, 0)?;
     info!("Blocked port: {}/{}", port, proto);
     Ok(())
 }
 
-pub fn allow_port(ebpf: &mut Ebpf, proto: &str, port: u16) -> Result<()> {
+pub fn allow_port(proto: &str, port: u16) -> Result<()> {
     let proto_num = parse_proto(proto)?;
     let key = (proto_num as u32) << 16 | port as u32;
-    let map = ebpf.map_mut("PORT_RULES").context("PORT_RULES map not found")?;
-    let mut port_rules: HashMap<_, u32, u32> =
-        HashMap::try_from(map).context("Failed to open PORT_RULES")?;
+    let mut port_rules = loader::open_pinned_map("PORT_RULES")?;
     port_rules.remove(&key)?;
     info!("Allowed port: {}/{}", port, proto);
     Ok(())
 }
 
-pub fn list_rules(ebpf: &mut Ebpf) -> Result<()> {
+pub fn list_rules() -> Result<()> {
     println!("=== IP Blocklist ===");
     {
-        let map = ebpf.map_mut("BLOCKLIST").context("BLOCKLIST map not found")?;
-        let blocklist: HashMap<_, u32, u32> =
-            HashMap::try_from(map).context("Failed to open BLOCKLIST")?;
+        let blocklist = loader::open_pinned_map("BLOCKLIST")?;
         let mut count = 0u32;
         for res in blocklist.iter() {
             let (ip, action) = res.context("Failed to read blocklist entry")?;
@@ -67,9 +58,7 @@ pub fn list_rules(ebpf: &mut Ebpf) -> Result<()> {
 
     println!("\n=== Port Rules ===");
     {
-        let map = ebpf.map_mut("PORT_RULES").context("PORT_RULES map not found")?;
-        let port_rules: HashMap<_, u32, u32> =
-            HashMap::try_from(map).context("Failed to open PORT_RULES")?;
+        let port_rules = loader::open_pinned_map("PORT_RULES")?;
         let mut count = 0u32;
         for res in port_rules.iter() {
             let (key, action) = res.context("Failed to read port rule entry")?;

@@ -7,9 +7,8 @@ use aya_ebpf::{
     maps::{HashMap, PerfEventArray},
     programs::XdpContext,
 };
-use aya_log_ebpf::info;
 use core::mem;
-use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
+use neko_common::{PacketLog, ACTION_DROP};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
