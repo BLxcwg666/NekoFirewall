@@ -56,7 +56,7 @@ fn build_ebpf(release: bool) {
 
 fn build_userspace(release: bool) {
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--package", "neko-firewall", "--target", "x86_64-unknown-linux-musl"]);
+    cmd.args(["+stable", "build", "--package", "neko-firewall", "--target", "x86_64-unknown-linux-musl"]);
     if release {
         cmd.arg("--release");
     }
