@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
-use aya::maps::HashMap;
-use neko_common::{ACTION_DROP, ACTION_PASS};
+use aya::maps::{Array, HashMap};
+use neko_common::{
+    CompoundRule, ACTION_DROP, ACTION_PASS, MAX_COMPOUND_RULES,
+    MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
+};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -16,6 +19,8 @@ pub struct Config {
     pub allow: AllowRules,
     #[serde(default)]
     pub block: BlockRules,
+    #[serde(default)]
+    pub rules: Vec<CompoundRuleEntry>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -38,6 +43,21 @@ pub struct BlockRules {
     pub countries: Vec<String>,
     #[serde(default)]
     pub asns: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompoundRuleEntry {
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proto: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asn: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
 }
 
 impl Config {
@@ -127,6 +147,25 @@ impl Config {
             }
         }
 
+        // Apply compound rules
+        if !self.rules.is_empty() {
+            let map = loader::open_pinned_map("RULES")?;
+            let mut arr: Array<_, CompoundRule> = Array::try_from(map)
+                .map_err(|e| anyhow::anyhow!("Failed to open RULES: {:?}", e))?;
+            for (i, entry) in self.rules.iter().enumerate() {
+                if i as u32 >= MAX_COMPOUND_RULES {
+                    eprintln!("  Warning: too many compound rules, max {}", MAX_COMPOUND_RULES);
+                    break;
+                }
+                if let Some(rule) = entry.to_bpf_rule() {
+                    arr.set(i as u32, rule, 0)
+                        .map_err(|e| anyhow::anyhow!("Failed to set RULES[{}]: {:?}", i, e))?;
+                } else {
+                    eprintln!("  Warning: skipping invalid compound rule #{}", i);
+                }
+            }
+        }
+
         Ok(())
     }
     
@@ -138,6 +177,7 @@ impl Config {
             + self.allow.asns.len()
             + self.block.countries.len()
             + self.block.asns.len()
+            + self.rules.len()
     }
 
     pub fn add_ip(&mut self, addr: Ipv4Addr) {
@@ -196,6 +236,80 @@ impl Config {
         } else {
             self.block.asns.push(asn);
         }
+    }
+
+    pub fn add_compound_rule(&mut self, entry: CompoundRuleEntry) {
+        self.rules.push(entry);
+    }
+
+    pub fn remove_compound_rule(&mut self, index: usize) {
+        if index < self.rules.len() {
+            self.rules.remove(index);
+        }
+    }
+}
+
+impl CompoundRuleEntry {
+    pub fn new(
+        action: u32,
+        proto: Option<&str>,
+        port: Option<u16>,
+        country: Option<&str>,
+        asn: Option<u32>,
+        ip: Option<Ipv4Addr>,
+    ) -> Self {
+        Self {
+            action: if action == ACTION_PASS {
+                "allow".into()
+            } else {
+                "drop".into()
+            },
+            proto: proto.map(|p| p.to_lowercase()),
+            port,
+            country: country.map(|c| c.to_uppercase()),
+            asn,
+            ip: ip.map(|a| a.to_string()),
+        }
+    }
+
+    fn to_bpf_rule(&self) -> Option<CompoundRule> {
+        let action = match self.action.as_str() {
+            "allow" => ACTION_PASS,
+            "drop" | "block" => ACTION_DROP,
+            _ => return None,
+        };
+        let mut rule = CompoundRule {
+            match_fields: 0,
+            action,
+            proto: 0,
+            _pad: [0],
+            port: 0,
+            country_id: 0,
+            asn_id: 0,
+            src_ip: 0,
+        };
+        if let Some(ref p) = self.proto {
+            rule.proto = parse_proto_num(p)?;
+            rule.match_fields |= MATCH_PROTO;
+        }
+        if let Some(port) = self.port {
+            rule.port = port;
+            rule.match_fields |= MATCH_PORT;
+        }
+        if let Some(ref c) = self.country {
+            rule.country_id = geo::country_to_id(c).ok()?;
+            rule.match_fields |= MATCH_COUNTRY;
+        }
+        if let Some(asn) = self.asn {
+            rule.asn_id = 0x80000000 | asn;
+            rule.match_fields |= MATCH_ASN;
+        }
+        if let Some(ref ip_str) = self.ip {
+            let addr: Ipv4Addr = ip_str.parse().ok()?;
+            rule.src_ip = u32::from(addr).to_be();
+            rule.match_fields |= MATCH_IP;
+        }
+        Some(rule)
     }
 }
 

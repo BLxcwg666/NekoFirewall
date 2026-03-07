@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use aya::{
     maps::{
         lpm_trie::{Key, LpmTrie},
-        HashMap, Map, MapData, MapInfo, MapType,
+        Array, HashMap, Map, MapData, MapInfo, MapType,
     },
     programs::{
         tc::{self, SchedClassifier, TcAttachType},
@@ -11,7 +11,7 @@ use aya::{
     Ebpf, EbpfLoader, Pod,
 };
 use log::info;
-use neko_common::ConnTrackKey;
+use neko_common::{CompoundRule, ConnTrackKey, MAX_COMPOUND_RULES};
 const EBPF_OBJ: &[u8] =
     include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
 const PIN_PATH: &str = "/sys/fs/bpf/neko";
@@ -61,6 +61,7 @@ pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
     clear_hash_map::<ConnTrackKey, u64>(ebpf, "CONNTRACK")?;
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_COUNTRY_MAP")?;
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_ASN_MAP")?;
+    clear_array::<CompoundRule>(ebpf, "RULES")?;
     Ok(())
 }
 
@@ -74,6 +75,7 @@ pub fn cleanup_pins() {
         "GEO_ASN_MAP",
         "GEO_POLICY",
         "GEO_MAP",
+        "RULES",
     ] {
         let pin = format!("{}/{}", PIN_PATH, name);
         std::fs::remove_file(&pin).ok();
@@ -99,7 +101,7 @@ pub fn open_pinned_perf_event_array(name: &str) -> Result<Map> {
     }
 }
 
-fn open_pinned_map(name: &str) -> Result<Map> {
+pub fn open_pinned_map(name: &str) -> Result<Map> {
     let pin = format!("{}/{}", PIN_PATH, name);
     let data = MapData::from_pin(&pin)
         .map_err(|e| anyhow::anyhow!("Failed to open {}: {} (is the firewall running?)", pin, e))?;
@@ -110,6 +112,7 @@ fn open_pinned_map(name: &str) -> Result<Map> {
         MapType::LruHash => Map::LruHashMap(data),
         MapType::LpmTrie => Map::LpmTrie(data),
         MapType::PerfEventArray => Map::PerfEventArray(data),
+        MapType::Array => Map::Array(data),
         other => {
             return Err(anyhow::anyhow!(
                 "Unsupported pinned map type {:?} for {}",
@@ -153,6 +156,18 @@ fn clear_lpm_trie<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
         typed
             .remove(&key)
             .with_context(|| format!("Failed to clear {}", name))?;
+    }
+    Ok(())
+}
+
+fn clear_array<V: Pod + Default>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+    let map = ebpf
+        .map_mut(name)
+        .with_context(|| format!("{} map not found", name))?;
+    let mut typed: Array<_, V> = Array::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open {} as Array: {:?}", name, e))?;
+    for i in 0..MAX_COMPOUND_RULES {
+        let _ = typed.set(i, V::default(), 0);
     }
     Ok(())
 }

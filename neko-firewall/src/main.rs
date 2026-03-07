@@ -1,3 +1,4 @@
+mod compound;
 mod config;
 mod geo;
 mod loader;
@@ -41,6 +42,10 @@ enum Commands {
     List,
     Conntrack,
     Monitor,
+    Rule {
+        #[command(subcommand)]
+        action: RuleAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -59,6 +64,27 @@ enum BlockTarget {
     Proto { proto: String },
     Country { code: String },
     Asn { asn: u32 },
+}
+
+#[derive(Subcommand)]
+enum RuleAction {
+    Add {
+        action: String,
+        #[arg(long)]
+        proto: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        country: Option<String>,
+        #[arg(long)]
+        asn: Option<u32>,
+        #[arg(long)]
+        ip: Option<Ipv4Addr>,
+    },
+    Remove {
+        index: u32,
+    },
+    List,
 }
 
 fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
@@ -196,6 +222,8 @@ async fn main() -> Result<()> {
             rule::list_rules()?;
             println!("\n=== Geo/ASN Policies ===");
             geo::list_policies()?;
+            println!("\n=== Compound Rules ===");
+            compound::list_rules()?;
         }
         Commands::Conntrack => {
             rule::show_conntrack()?;
@@ -227,6 +255,39 @@ async fn main() -> Result<()> {
 
             signal::ctrl_c().await?;
         }
+        Commands::Rule { action } => match action {
+            RuleAction::Add {
+                action,
+                proto,
+                port,
+                country,
+                asn,
+                ip,
+            } => {
+                let action_val = match action.to_lowercase().as_str() {
+                    "allow" => ACTION_PASS,
+                    "drop" | "block" => ACTION_DROP,
+                    _ => anyhow::bail!("Action must be 'allow' or 'drop'"),
+                };
+                let idx = compound::add_rule(
+                    action_val,
+                    proto.as_deref(),
+                    port,
+                    country.as_deref(),
+                    asn,
+                    ip,
+                )?;
+                println!("Added compound rule [{}]", idx);
+            }
+            RuleAction::Remove { index } => {
+                compound::remove_rule(index)?;
+                println!("Removed compound rule [{}]", index);
+            }
+            RuleAction::List => {
+                println!("=== Compound Rules ===");
+                compound::list_rules()?;
+            }
+        },
     }
 
     Ok(())
