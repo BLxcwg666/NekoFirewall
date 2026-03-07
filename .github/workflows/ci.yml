@@ -19,11 +19,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-19 clang-19 libelf-dev linux-headers-generic
+          sudo apt-get install -y llvm-19 clang-19 libelf-dev linux-headers-generic musl-tools
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: x86_64-unknown-linux-musl
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -43,4 +44,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: neko-firewall
-          path: target/release/neko-firewall
+          path: target/x86_64-unknown-linux-musl/release/neko-firewall
