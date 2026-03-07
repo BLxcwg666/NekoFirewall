@@ -13,6 +13,7 @@ use aya::{
 use log::info;
 use neko_common::{CompoundRule, MAX_COMPOUND_RULES};
 use std::process::Command;
+
 const EBPF_OBJ: &[u8] =
     include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
 const PIN_PATH: &str = "/sys/fs/bpf/neko";
@@ -22,9 +23,10 @@ pub fn load(_iface: &str) -> Result<Ebpf> {
     std::fs::create_dir_all(PIN_PATH)
         .with_context(|| format!("Failed to create pin path {}", PIN_PATH))?;
 
+    // .to_vec() ensures 8-byte alignment required for ELF parsing
     let mut ebpf = EbpfLoader::new()
         .map_pin_path(PIN_PATH)
-        .load(EBPF_OBJ)
+        .load(&EBPF_OBJ.to_vec())
         .context("Failed to load eBPF program")?;
 
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {

@@ -69,11 +69,14 @@ fn ptr_at<T>(start: usize, end: usize, offset: usize) -> Result<*const T, ()> {
 
 #[inline(always)]
 fn ipv4_header_len(ipv4hdr: *const Ipv4Hdr) -> Result<usize, ()> {
-    let len = unsafe { (*ipv4hdr).ihl() as usize };
-    if len < Ipv4Hdr::LEN {
+    let ihl = unsafe { (*ipv4hdr).ihl() };
+    // Only support standard 20-byte IP headers (IHL=5).
+    // IP options (IHL>5) are extremely rare and would cause
+    // BPF verifier issues with variable-offset packet access.
+    if ihl != 5 {
         return Err(());
     }
-    Ok(len)
+    Ok(Ipv4Hdr::LEN)
 }
 
 fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
@@ -99,6 +102,7 @@ fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
+    // --- Extract ports (transport_offset is now fixed, ptr_at works) ---
     let (src_port, dst_port, ct_src_port, ct_dst_port) = match proto {
         IpProto::Tcp => {
             let tcphdr: *const TcpHdr = ptr_at(start, end, transport_offset)?;
