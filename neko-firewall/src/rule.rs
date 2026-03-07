@@ -6,11 +6,17 @@ use std::net::Ipv4Addr;
 
 use crate::loader;
 
+use crate::config::Config;
+
 pub fn allow_ip(addr: Ipv4Addr) -> Result<()> {
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_IPS")?;
     let ip: u32 = addr.into();
     map.insert(ip, ACTION_PASS, 0)?;
     info!("Whitelisted IP: {}", addr);
+
+    let mut cfg = Config::load()?;
+    cfg.add_ip(addr);
+    cfg.save()?;
     Ok(())
 }
 
@@ -19,6 +25,10 @@ pub fn block_ip(addr: Ipv4Addr) -> Result<()> {
     let ip: u32 = addr.into();
     map.remove(&ip)?;
     info!("Removed IP from whitelist: {}", addr);
+
+    let mut cfg = Config::load()?;
+    cfg.remove_ip(addr);
+    cfg.save()?;
     Ok(())
 }
 
@@ -29,6 +39,10 @@ pub fn allow_port(proto: &str, port: u16) -> Result<()> {
     map.insert(key, ACTION_PASS, 0)?;
     let label = if proto_num == 1 { "type" } else { "port" };
     info!("Whitelisted {} {} {}", proto, label, port);
+
+    let mut cfg = Config::load()?;
+    cfg.add_port(proto, port);
+    cfg.save()?;
     Ok(())
 }
 
@@ -38,6 +52,10 @@ pub fn block_port(proto: &str, port: u16) -> Result<()> {
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.remove(&key)?;
     info!("Removed from whitelist: {} {}", proto, port);
+
+    let mut cfg = Config::load()?;
+    cfg.remove_port(proto, port);
+    cfg.save()?;
     Ok(())
 }
 
@@ -47,6 +65,10 @@ pub fn allow_proto(proto: &str) -> Result<()> {
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.insert(key, ACTION_PASS, 0)?;
     info!("Whitelisted protocol: {}", proto);
+
+    let mut cfg = Config::load()?;
+    cfg.add_proto(proto);
+    cfg.save()?;
     Ok(())
 }
 
@@ -56,6 +78,10 @@ pub fn block_proto(proto: &str) -> Result<()> {
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.remove(&key)?;
     info!("Removed protocol from whitelist: {}", proto);
+
+    let mut cfg = Config::load()?;
+    cfg.remove_proto(proto);
+    cfg.save()?;
     Ok(())
 }
 

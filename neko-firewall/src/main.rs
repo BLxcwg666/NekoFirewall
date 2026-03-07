@@ -1,3 +1,4 @@
+mod config;
 mod geo;
 mod loader;
 mod rule;
@@ -126,6 +127,13 @@ async fn main() -> Result<()> {
                 "  Loaded {} country + {} ASN prefixes",
                 geo_count, asn_count
             );
+
+            let cfg = config::Config::load()?;
+            let rule_count = cfg.rule_count();
+            cfg.apply()?;
+            if rule_count > 0 {
+                println!("  Restored {} rules from config", rule_count);
+            }
 
             set_title(&format!("NekoFirewall | {} · whitelist", iface));
             println!("Firewall running on {} (whitelist mode)", iface);

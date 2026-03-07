@@ -6,6 +6,8 @@ use maxminddb::geoip2;
 
 use crate::loader;
 
+use crate::config::Config;
+
 const COUNTRY_MMDB: &[u8] = include_bytes!("../resources/GeoLite2-Country.mmdb");
 const ASN_MMDB: &[u8] = include_bytes!("../resources/GeoLite2-ASN.mmdb");
 
@@ -95,6 +97,10 @@ pub fn set_country_policy(action: u32, code: &str) -> Result<()> {
     let geo_id = country_to_id(code)?;
     let mut map = open_geo_policy()?;
     map.insert(geo_id, action, 0)?;
+
+    let mut cfg = Config::load()?;
+    cfg.set_country(action, code);
+    cfg.save()?;
     Ok(())
 }
 
@@ -102,6 +108,10 @@ pub fn set_asn_policy(action: u32, asn: u32) -> Result<()> {
     let asn_id = 0x80000000 | asn;
     let mut map = open_geo_policy()?;
     map.insert(asn_id, action, 0)?;
+
+    let mut cfg = Config::load()?;
+    cfg.set_asn(action, asn);
+    cfg.save()?;
     Ok(())
 }
 

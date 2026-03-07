@@ -18,4 +18,6 @@ log = { workspace = true }
 ipnetwork = "0.21"
 maxminddb = "0.27"
 neko-common = { path = "../neko-common", features = ["user"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 tokio = { workspace = true }
