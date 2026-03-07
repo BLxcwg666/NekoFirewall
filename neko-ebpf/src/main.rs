@@ -3,12 +3,13 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    macros::{map, xdp},
+    helpers::bpf_ktime_get_ns,
+    macros::{classifier, map, xdp},
     maps::{HashMap, PerfEventArray},
-    programs::XdpContext,
+    programs::{TcContext, XdpContext},
 };
 use core::mem;
-use neko_common::{PacketLog, ACTION_DROP};
+use neko_common::{ConnTrackKey, PacketLog, ACTION_DROP};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -16,11 +17,15 @@ use network_types::{
     udp::UdpHdr,
 };
 
+const CONNTRACK_TIMEOUT_NS: u64 = 300_000_000_000;
 #[map]
-static BLOCKLIST: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+static ALLOWED_IPS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-static PORT_RULES: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+static ALLOWED_PORTS: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+static CONNTRACK: HashMap<ConnTrackKey, u64> = HashMap::with_max_entries(65536, 0);
 
 #[map]
 static EVENTS: PerfEventArray<PacketLog> = PerfEventArray::new(0);
@@ -34,72 +39,139 @@ pub fn neko_firewall(ctx: XdpContext) -> u32 {
 }
 
 #[inline(always)]
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
+fn ptr_at<T>(start: usize, end: usize, offset: usize) -> Result<*const T, ()> {
     let len = mem::size_of::<T>();
-
     if start + offset + len > end {
         return Err(());
     }
-
     Ok((start + offset) as *const T)
 }
 
 fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
-    let ethhdr: *const EthHdr = ptr_at(ctx, 0)?;
+    let start = ctx.data();
+    let end = ctx.data_end();
+
+    let ethhdr: *const EthHdr = ptr_at(start, end, 0)?;
     match unsafe { (*ethhdr).ether_type } {
         EtherType::Ipv4 => {}
-        _ => return Ok(xdp_action::XDP_PASS),
+        _ => return Ok(xdp_action::XDP_PASS), // Allow ARP, IPv6, etc.
     }
 
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN)?;
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, EthHdr::LEN)?;
     let src_addr = unsafe { (*ipv4hdr).src_addr };
     let dst_addr = unsafe { (*ipv4hdr).dst_addr };
     let proto = unsafe { (*ipv4hdr).proto };
 
-    // Check IP blocklist
-    if let Some(&action) = unsafe { BLOCKLIST.get(&u32::from_be(src_addr)) } {
-        if action == ACTION_DROP {
-            log_event(ctx, src_addr, dst_addr, 0, 0, proto as u8, ACTION_DROP as u8);
-            return Ok(xdp_action::XDP_DROP);
-        }
+    if matches!(proto, IpProto::Icmp) {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let src_host = u32::from_be(src_addr);
+    if unsafe { ALLOWED_IPS.get(&src_host) }.is_some() {
+        return Ok(xdp_action::XDP_PASS);
     }
 
     // Extract ports for TCP/UDP
-    let (src_port, dst_port) = match proto {
+    let (src_port, dst_port, raw_src_port, raw_dst_port) = match proto {
         IpProto::Tcp => {
-            let tcphdr: *const TcpHdr = ptr_at(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            let src = u16::from_be(unsafe { (*tcphdr).source });
-            let dst = u16::from_be(unsafe { (*tcphdr).dest });
-            (src, dst)
+            let tcphdr: *const TcpHdr = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            let raw_src = unsafe { (*tcphdr).source };
+            let raw_dst = unsafe { (*tcphdr).dest };
+            (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
         }
         IpProto::Udp => {
-            let udphdr: *const UdpHdr = ptr_at(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            let src = u16::from_be(unsafe { (*udphdr).source });
-            let dst = u16::from_be(unsafe { (*udphdr).dest });
-            (src, dst)
+            let udphdr: *const UdpHdr = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            let raw_src = unsafe { (*udphdr).source };
+            let raw_dst = unsafe { (*udphdr).dest };
+            (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
         }
-        _ => (0u16, 0u16),
+        _ => return Ok(xdp_action::XDP_PASS), // Allow non-TCP/UDP
     };
 
-    // Check port rules: key = (proto << 16) | port
-    if dst_port != 0 {
-        let proto_num: u8 = match proto {
-            IpProto::Tcp => 6,
-            IpProto::Udp => 17,
-            _ => 0,
-        };
-        let port_key = (proto_num as u32) << 16 | dst_port as u32;
-        if let Some(&action) = unsafe { PORT_RULES.get(&port_key) } {
-            if action == ACTION_DROP {
-                log_event(ctx, src_addr, dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                return Ok(xdp_action::XDP_DROP);
-            }
+    let proto_num = proto_to_num(proto);
+    let port_key = (proto_num as u32) << 16 | dst_port as u32;
+    if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    let ct_key = ConnTrackKey {
+        src_ip: src_addr,
+        dst_ip: dst_addr,
+        src_port: raw_src_port,
+        dst_port: raw_dst_port,
+        proto: proto_num,
+        _pad: [0; 3],
+    };
+
+    if let Some(&last_seen) = unsafe { CONNTRACK.get(&ct_key) } {
+        let now = unsafe { bpf_ktime_get_ns() };
+        if now.wrapping_sub(last_seen) < CONNTRACK_TIMEOUT_NS {
+            let _ = CONNTRACK.insert(&ct_key, &now, 0);
+            return Ok(xdp_action::XDP_PASS);
         }
     }
 
-    Ok(xdp_action::XDP_PASS)
+    log_event(ctx, src_addr, dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
+    Ok(xdp_action::XDP_DROP)
+}
+
+#[classifier]
+pub fn neko_egress(ctx: TcContext) -> i32 {
+    match try_neko_egress(&ctx) {
+        Ok(action) => action,
+        Err(_) => 0, // TC_ACT_OK
+    }
+}
+
+fn try_neko_egress(ctx: &TcContext) -> Result<i32, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+
+    let ethhdr: *const EthHdr = ptr_at(start, end, 0)?;
+    match unsafe { (*ethhdr).ether_type } {
+        EtherType::Ipv4 => {}
+        _ => return Ok(0),
+    }
+
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, EthHdr::LEN)?;
+    let src_addr = unsafe { (*ipv4hdr).src_addr }; // local IP
+    let dst_addr = unsafe { (*ipv4hdr).dst_addr }; // remote IP
+    let proto = unsafe { (*ipv4hdr).proto };
+
+    let (raw_src_port, raw_dst_port) = match proto {
+        IpProto::Tcp => {
+            let tcphdr: *const TcpHdr = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            (unsafe { (*tcphdr).source }, unsafe { (*tcphdr).dest })
+        }
+        IpProto::Udp => {
+            let udphdr: *const UdpHdr = ptr_at(start, end, EthHdr::LEN + Ipv4Hdr::LEN)?;
+            (unsafe { (*udphdr).source }, unsafe { (*udphdr).dest })
+        }
+        _ => return Ok(0),
+    };
+    
+    let ct_key = ConnTrackKey {
+        src_ip: dst_addr,       // remote IP → ingress src
+        dst_ip: src_addr,       // local IP  → ingress dst
+        src_port: raw_dst_port, // remote port → ingress src_port
+        dst_port: raw_src_port, // local port  → ingress dst_port
+        proto: proto_to_num(proto),
+        _pad: [0; 3],
+    };
+
+    let now = unsafe { bpf_ktime_get_ns() };
+    let _ = CONNTRACK.insert(&ct_key, &now, 0);
+
+    Ok(0) // TC_ACT_OK
+}
+
+#[inline(always)]
+fn proto_to_num(proto: IpProto) -> u8 {
+    match proto {
+        IpProto::Tcp => 6,
+        IpProto::Udp => 17,
+        _ => 0,
+    }
 }
 
 #[inline(always)]
