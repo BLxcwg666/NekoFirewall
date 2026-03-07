@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/nf run -i %i
-ExecStopPost=/bin/rm -rf /sys/fs/bpf/neko
+ExecStop=/usr/local/bin/nf stop -i %i
 
 Restart=on-failure
 RestartSec=5

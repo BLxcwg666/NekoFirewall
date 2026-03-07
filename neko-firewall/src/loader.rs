@@ -11,12 +11,13 @@ use aya::{
     Ebpf, EbpfLoader, Pod,
 };
 use log::info;
-use neko_common::{CompoundRule, ConnTrackKey, MAX_COMPOUND_RULES};
+use neko_common::{CompoundRule, MAX_COMPOUND_RULES};
+use std::process::Command;
 const EBPF_OBJ: &[u8] =
     include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
 const PIN_PATH: &str = "/sys/fs/bpf/neko";
 
-pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
+pub fn load(iface: &str) -> Result<Ebpf> {
 
     std::fs::create_dir_all(PIN_PATH)
         .with_context(|| format!("Failed to create pin path {}", PIN_PATH))?;
@@ -30,12 +31,30 @@ pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
         log::warn!("Failed to init eBPF logger: {}", e);
     }
 
+    // Load programs into kernel (but don't attach yet)
     let xdp: &mut Xdp = ebpf
         .program_mut("neko_firewall")
         .unwrap()
         .try_into()
         .context("Failed to get XDP program")?;
     xdp.load().context("Failed to load XDP program")?;
+
+    let tc_prog: &mut SchedClassifier = ebpf
+        .program_mut("neko_egress")
+        .unwrap()
+        .try_into()
+        .context("Failed to get TC program")?;
+    tc_prog.load().context("Failed to load TC program")?;
+
+    Ok(ebpf)
+}
+
+pub fn attach(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
+    let xdp: &mut Xdp = ebpf
+        .program_mut("neko_firewall")
+        .unwrap()
+        .try_into()
+        .context("Failed to get XDP program")?;
     xdp.attach(iface, XdpFlags::SKB_MODE)
         .with_context(|| format!("Failed to attach XDP to {}", iface))?;
     info!("XDP program attached to {} (ingress)", iface);
@@ -48,17 +67,16 @@ pub fn load_and_attach(iface: &str) -> Result<Ebpf> {
         .unwrap()
         .try_into()
         .context("Failed to get TC program")?;
-    tc_prog.load().context("Failed to load TC program")?;
     tc_prog
         .attach(iface, TcAttachType::Egress)
         .with_context(|| format!("Failed to attach TC egress to {}", iface))?;
     info!("TC egress program attached to {} (conntrack)", iface);
 
-    Ok(ebpf)
+    Ok(())
 }
 
 pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
-    clear_hash_map::<ConnTrackKey, u64>(ebpf, "CONNTRACK")?;
+    // Don't clear CONNTRACK — preserve existing connections (e.g. SSH)
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_COUNTRY_MAP")?;
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_ASN_MAP")?;
     clear_array::<CompoundRule>(ebpf, "RULES")?;
@@ -81,6 +99,38 @@ pub fn cleanup_pins() {
         std::fs::remove_file(&pin).ok();
     }
     std::fs::remove_dir(PIN_PATH).ok();
+}
+
+pub fn force_stop(iface: &str) -> Result<()> {
+    let xdp_out = Command::new("ip")
+        .args(["link", "set", "dev", iface, "xdpgeneric", "off"])
+        .output()
+        .context("Failed to run 'ip' command")?;
+    if xdp_out.status.success() {
+        println!("Detached XDP from {}", iface);
+    } else {
+        let stderr = String::from_utf8_lossy(&xdp_out.stderr);
+        if !stderr.contains("No such device") {
+            eprintln!("Warning: XDP detach: {}", stderr.trim());
+        }
+    }
+
+    let tc_out = Command::new("tc")
+        .args(["qdisc", "del", "dev", iface, "clsact"])
+        .output()
+        .context("Failed to run 'tc' command")?;
+    if tc_out.status.success() {
+        println!("Removed TC qdisc from {}", iface);
+    } else {
+        let stderr = String::from_utf8_lossy(&tc_out.stderr);
+        if !stderr.contains("Cannot find") {
+            eprintln!("Warning: TC detach: {}", stderr.trim());
+        }
+    }
+
+    cleanup_pins();
+    println!("Cleaned up pinned maps");
+    Ok(())
 }
 
 pub fn open_pinned_hashmap<K: Pod, V: Pod>(name: &str) -> Result<HashMap<MapData, K, V>> {

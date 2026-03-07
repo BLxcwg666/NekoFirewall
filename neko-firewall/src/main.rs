@@ -42,6 +42,10 @@ enum Commands {
     List,
     Conntrack,
     Monitor,
+    Stop {
+        #[arg(short, long)]
+        iface: String,
+    },
     Rule {
         #[command(subcommand)]
         action: RuleAction,
@@ -132,6 +136,30 @@ fn print_packet_log(log: &PacketLog) {
     }
 }
 
+fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
+    let ssh_port = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|conn| conn.split_whitespace().nth(3).and_then(|p| p.parse::<u16>().ok()))
+        .unwrap_or(22);
+
+    let map = ebpf.map("ALLOWED_PORTS").expect("ALLOWED_PORTS map not found");
+    let map: aya::maps::HashMap<_, u32, u32> =
+        aya::maps::HashMap::try_from(map).expect("ALLOWED_PORTS type mismatch");
+
+    let tcp_wildcard = 6u32 << 16;
+    let ssh_key = (6u32 << 16) | ssh_port as u32;
+
+    if map.get(&tcp_wildcard, 0).is_ok() || map.get(&ssh_key, 0).is_ok() {
+        return;
+    }
+
+    eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    eprintln!("!  WARNING: SSH port {}/tcp is NOT in allowed rules", ssh_port);
+    eprintln!("!  You may lose SSH access after firewall attaches");
+    eprintln!("!  Run: nf allow port tcp {}", ssh_port);
+    eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -143,7 +171,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Run { iface } => {
-            let mut ebpf = loader::load_and_attach(&iface)?;
+            let mut ebpf = loader::load(&iface)?;
             loader::reset_runtime_maps(&mut ebpf)?;
 
             println!("Loading GeoIP databases...");
@@ -161,9 +189,12 @@ async fn main() -> Result<()> {
                 println!("  Restored {} rules from config", rule_count);
             }
 
+            check_ssh_safety(&mut ebpf);
+            loader::attach(&mut ebpf, &iface)?;
+
             set_title(&format!("NekoFirewall | {} · whitelist", iface));
             println!("Firewall running on {} (whitelist mode)", iface);
-            println!("  Use 'allow/block country/asn' for geo filtering");
+            println!("  Use 'nf stop -i {}' for emergency detach", iface);
             println!("Press Ctrl+C to stop.");
             spawn_event_readers(&mut ebpf)?;
             signal::ctrl_c().await?;
@@ -254,6 +285,10 @@ async fn main() -> Result<()> {
             }
 
             signal::ctrl_c().await?;
+        }
+        Commands::Stop { iface } => {
+            loader::force_stop(&iface)?;
+            println!("Firewall stopped on {}", iface);
         }
         Commands::Rule { action } => match action {
             RuleAction::Add {
