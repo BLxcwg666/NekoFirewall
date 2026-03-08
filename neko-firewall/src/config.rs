@@ -7,7 +7,7 @@ use neko_common::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::{geo, loader, rule};
+use crate::{geo, loader, rule::{self, CidrAddr}};
 
 const CONFIG_DIR: &str = "/etc/neko-firewall";
 const CONFIG_PATH: &str = "/etc/neko-firewall/rules.toml";
@@ -81,13 +81,21 @@ impl Config {
     pub fn apply(&self) -> Result<()> {
         // Apply IP rules (LpmTrie/CIDR)
         if !self.allow.ips.is_empty() {
-            let mut map = loader::open_pinned_lpm_trie::<u32, u32>("ALLOWED_IPS")?;
+            let mut map4 = loader::open_pinned_lpm_trie::<u32, u32>("ALLOWED_IPS")?;
+            let mut map6 = loader::open_pinned_lpm_trie::<[u8; 16], u32>("ALLOWED_IPS6")?;
             for cidr in &self.allow.ips {
-                if let Ok((ip, prefix)) = rule::parse_cidr(cidr) {
-                    let key = Key::new(prefix as u32, u32::from(ip).to_be());
-                    map.insert(&key, ACTION_PASS, 0)?;
-                } else {
-                    eprintln!("  Warning: skipping invalid IP/CIDR '{}'", cidr);
+                match rule::parse_cidr(cidr) {
+                    Ok(CidrAddr::V4(ip, prefix)) => {
+                        let key = Key::new(prefix as u32, u32::from(ip).to_be());
+                        map4.insert(&key, ACTION_PASS, 0)?;
+                    }
+                    Ok(CidrAddr::V6(ip, prefix)) => {
+                        let key = Key::new(prefix as u32, ip.octets());
+                        map6.insert(&key, ACTION_PASS, 0)?;
+                    }
+                    Err(_) => {
+                        eprintln!("  Warning: skipping invalid IP/CIDR '{}'", cidr);
+                    }
                 }
             }
         }
@@ -167,7 +175,7 @@ impl Config {
 
         Ok(())
     }
-    
+
     pub fn rule_count(&self) -> usize {
         self.allow.ips.len()
             + self.allow.ports.len()
@@ -277,46 +285,52 @@ impl CompoundRuleEntry {
             "drop" | "block" => ACTION_DROP,
             _ => return None,
         };
-        let mut rule = CompoundRule {
-            match_fields: 0,
-            action,
-            proto: 0,
-            prefix_len: 0,
-            port: 0,
-            country_id: 0,
-            asn_id: 0,
-            src_ip: 0,
-        };
+        let mut bpf_rule = CompoundRule::default();
+        bpf_rule.action = action;
+
         if let Some(ref p) = self.proto {
-            rule.proto = parse_proto_num(p)?;
-            rule.match_fields |= MATCH_PROTO;
+            bpf_rule.proto = parse_proto_num(p)?;
+            bpf_rule.match_fields |= MATCH_PROTO;
         }
         if let Some(port) = self.port {
-            rule.port = port;
-            rule.match_fields |= MATCH_PORT;
+            bpf_rule.port = port;
+            bpf_rule.match_fields |= MATCH_PORT;
         }
         if let Some(ref c) = self.country {
-            rule.country_id = geo::country_to_id(c).ok()?;
-            rule.match_fields |= MATCH_COUNTRY;
+            bpf_rule.country_id = geo::country_to_id(c).ok()?;
+            bpf_rule.match_fields |= MATCH_COUNTRY;
         }
         if let Some(asn) = self.asn {
-            rule.asn_id = 0x80000000 | asn;
-            rule.match_fields |= MATCH_ASN;
+            bpf_rule.asn_id = 0x80000000 | asn;
+            bpf_rule.match_fields |= MATCH_ASN;
         }
         if let Some(ref ip_str) = self.ip {
-            let (addr, prefix) = rule::parse_cidr(ip_str).ok()?;
-            rule.src_ip = u32::from(addr).to_be();
-            rule.prefix_len = prefix;
-            rule.match_fields |= MATCH_IP;
+            match rule::parse_cidr(ip_str).ok()? {
+                CidrAddr::V4(addr, prefix) => {
+                    let bytes = u32::from(addr).to_be().to_ne_bytes();
+                    bpf_rule.src_ip[0] = bytes[0];
+                    bpf_rule.src_ip[1] = bytes[1];
+                    bpf_rule.src_ip[2] = bytes[2];
+                    bpf_rule.src_ip[3] = bytes[3];
+                    bpf_rule.prefix_len = prefix;
+                    bpf_rule.family = 4;
+                }
+                CidrAddr::V6(addr, prefix) => {
+                    bpf_rule.src_ip = addr.octets();
+                    bpf_rule.prefix_len = prefix;
+                    bpf_rule.family = 6;
+                }
+            }
+            bpf_rule.match_fields |= MATCH_IP;
         }
-        Some(rule)
+        Some(bpf_rule)
     }
 }
 
 fn format_port_entry(proto: &str, port: u16) -> String {
     let p = proto.to_lowercase();
-    if p == "icmp" {
-        format!("icmp/{}", port)
+    if p == "icmp" || p == "icmpv6" || p == "ipv6-icmp" {
+        format!("{}/{}", p, port)
     } else {
         format!("{}/{}", p, port)
     }
@@ -333,6 +347,7 @@ fn parse_proto_num(proto: &str) -> Option<u8> {
         "tcp" => Some(6),
         "udp" => Some(17),
         "icmp" => Some(1),
+        "icmpv6" | "ipv6-icmp" => Some(58),
         _ => None,
     }
 }

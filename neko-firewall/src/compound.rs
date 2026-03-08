@@ -5,9 +5,9 @@ use neko_common::{
     CompoundRule, ACTION_PASS, MAX_COMPOUND_RULES,
     MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
 };
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::{config::{CompoundRuleEntry, Config}, geo, loader, rule};
+use crate::{config::{CompoundRuleEntry, Config}, geo, loader, rule::{self, CidrAddr}};
 
 pub fn add_rule(
     action: u32,
@@ -17,16 +17,8 @@ pub fn add_rule(
     asn: Option<u32>,
     ip: Option<&str>,
 ) -> Result<u32> {
-    let mut bpf_rule = CompoundRule {
-        match_fields: 0,
-        action,
-        proto: 0,
-        prefix_len: 0,
-        port: 0,
-        country_id: 0,
-        asn_id: 0,
-        src_ip: 0,
-    };
+    let mut bpf_rule = CompoundRule::default();
+    bpf_rule.action = action;
 
     if let Some(p) = proto {
         bpf_rule.proto = parse_proto(p)?;
@@ -45,9 +37,22 @@ pub fn add_rule(
         bpf_rule.match_fields |= MATCH_ASN;
     }
     if let Some(cidr) = ip {
-        let (addr, prefix) = rule::parse_cidr(cidr)?;
-        bpf_rule.src_ip = u32::from(addr).to_be();
-        bpf_rule.prefix_len = prefix;
+        match rule::parse_cidr(cidr)? {
+            CidrAddr::V4(addr, prefix) => {
+                let bytes = u32::from(addr).to_be().to_ne_bytes();
+                bpf_rule.src_ip[0] = bytes[0];
+                bpf_rule.src_ip[1] = bytes[1];
+                bpf_rule.src_ip[2] = bytes[2];
+                bpf_rule.src_ip[3] = bytes[3];
+                bpf_rule.prefix_len = prefix;
+                bpf_rule.family = 4;
+            }
+            CidrAddr::V6(addr, prefix) => {
+                bpf_rule.src_ip = addr.octets();
+                bpf_rule.prefix_len = prefix;
+                bpf_rule.family = 6;
+            }
+        }
         bpf_rule.match_fields |= MATCH_IP;
     }
 
@@ -115,12 +120,27 @@ pub fn list_rules() -> Result<()> {
             parts.push(format!("asn={}", rule.asn_id & 0x7FFFFFFF));
         }
         if rule.match_fields & MATCH_IP != 0 {
-            let ip = Ipv4Addr::from(u32::from_be(rule.src_ip));
-            if rule.prefix_len < 32 {
-                parts.push(format!("ip={}/{}", ip, rule.prefix_len));
+            let ip_str = if rule.family == 6 {
+                let ip = Ipv6Addr::from(rule.src_ip);
+                if rule.prefix_len < 128 {
+                    format!("ip={}/{}", ip, rule.prefix_len)
+                } else {
+                    format!("ip={}", ip)
+                }
             } else {
-                parts.push(format!("ip={}", ip));
-            }
+                let ip = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes([
+                    rule.src_ip[0],
+                    rule.src_ip[1],
+                    rule.src_ip[2],
+                    rule.src_ip[3],
+                ])));
+                if rule.prefix_len < 32 {
+                    format!("ip={}/{}", ip, rule.prefix_len)
+                } else {
+                    format!("ip={}", ip)
+                }
+            };
+            parts.push(ip_str);
         }
         println!("  [{}] {} {}", i, action_str, parts.join(" "));
         count += 1;
@@ -142,7 +162,8 @@ fn parse_proto(proto: &str) -> Result<u8> {
         "tcp" => Ok(6),
         "udp" => Ok(17),
         "icmp" => Ok(1),
-        _ => bail!("Unsupported protocol: {} (use tcp, udp, or icmp)", proto),
+        "icmpv6" | "ipv6-icmp" => Ok(58),
+        _ => bail!("Unsupported protocol: {} (use tcp, udp, icmp, or icmpv6)", proto),
     }
 }
 
@@ -151,6 +172,7 @@ fn proto_name(num: u8) -> &'static str {
         1 => "icmp",
         6 => "tcp",
         17 => "udp",
+        58 => "icmpv6",
         _ => "unknown",
     }
 }

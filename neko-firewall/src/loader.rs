@@ -78,9 +78,11 @@ pub fn attach(ebpf: &mut Ebpf, iface: &str) -> Result<()> {
 }
 
 pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
-    // Don't clear CONNTRACK — preserve existing connections (e.g. SSH)
+    // Don't clear CONNTRACK/CONNTRACK6 — preserve existing connections (e.g. SSH)
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_COUNTRY_MAP")?;
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_ASN_MAP")?;
+    clear_lpm_trie::<[u8; 16], u32>(ebpf, "GEO_COUNTRY_MAP6")?;
+    clear_lpm_trie::<[u8; 16], u32>(ebpf, "GEO_ASN_MAP6")?;
     clear_array::<CompoundRule>(ebpf, "RULES")?;
     Ok(())
 }
@@ -88,11 +90,15 @@ pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
 pub fn cleanup_pins() {
     for name in [
         "ALLOWED_IPS",
+        "ALLOWED_IPS6",
         "ALLOWED_PORTS",
         "CONNTRACK",
+        "CONNTRACK6",
         "EVENTS",
         "GEO_COUNTRY_MAP",
+        "GEO_COUNTRY_MAP6",
         "GEO_ASN_MAP",
+        "GEO_ASN_MAP6",
         "GEO_POLICY",
         "GEO_MAP",
         "RULES",
@@ -180,24 +186,6 @@ pub fn open_pinned_map(name: &str) -> Result<Map> {
         }
     };
     Ok(map)
-}
-
-fn clear_hash_map<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
-    let map = ebpf
-        .map_mut(name)
-        .with_context(|| format!("{} map not found", name))?;
-    let mut typed: HashMap<_, K, V> = HashMap::try_from(map)
-        .map_err(|e| anyhow::anyhow!("Failed to open {} as HashMap: {:?}", name, e))?;
-    let keys = typed
-        .keys()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("Failed to enumerate {}", name))?;
-    for key in keys {
-        typed
-            .remove(&key)
-            .with_context(|| format!("Failed to clear {}", name))?;
-    }
-    Ok(())
 }
 
 fn clear_lpm_trie<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {

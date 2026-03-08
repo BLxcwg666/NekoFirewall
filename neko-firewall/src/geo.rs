@@ -27,70 +27,100 @@ pub fn id_to_country(id: u32) -> String {
     format!("{}{}", a, b)
 }
 
-pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
+pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
     let reader = maxminddb::Reader::from_source(COUNTRY_MMDB.to_vec())
         .context("Failed to load embedded Country mmdb")?;
 
-    let map = ebpf
-        .map_mut("GEO_COUNTRY_MAP")
-        .context("GEO_COUNTRY_MAP not found")?;
-    let mut trie: LpmTrie<_, u32, u32> =
-        LpmTrie::try_from(map).context("Failed to open GEO_COUNTRY_MAP")?;
+    let map4 = ebpf.take_map("GEO_COUNTRY_MAP").context("GEO_COUNTRY_MAP not found")?;
+    let mut trie4: LpmTrie<_, u32, u32> =
+        LpmTrie::try_from(map4).context("Failed to open GEO_COUNTRY_MAP")?;
 
-    let mut count = 0usize;
+    let map6 = ebpf.take_map("GEO_COUNTRY_MAP6").context("GEO_COUNTRY_MAP6 not found")?;
+    let mut trie6: LpmTrie<_, [u8; 16], u32> =
+        LpmTrie::try_from(map6).context("Failed to open GEO_COUNTRY_MAP6")?;
+
+    let mut count4 = 0usize;
+    let mut count6 = 0usize;
 
     for result in reader.networks(Default::default())? {
         let item = result?;
         let record: Option<geoip2::Country> = item.decode()?;
         if let Some(record) = record {
             if let Some(iso_code) = record.country.iso_code {
-                if let Ok(IpNetwork::V4(net)) = item.network() {
-                    let prefix_len = net.prefix() as u32;
-                    let ip_be = u32::from(net.ip()).to_be();
-                    let key = Key::new(prefix_len, ip_be);
-                    let geo_id = country_to_id(iso_code)?;
-                    let _ = trie.insert(&key, geo_id, 0);
-                    count += 1;
+                let geo_id = match country_to_id(iso_code) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                match item.network() {
+                    Ok(IpNetwork::V4(net)) => {
+                        let prefix_len = net.prefix() as u32;
+                        let ip_be = u32::from(net.ip()).to_be();
+                        let key = Key::new(prefix_len, ip_be);
+                        let _ = trie4.insert(&key, geo_id, 0);
+                        count4 += 1;
+                    }
+                    Ok(IpNetwork::V6(net)) => {
+                        let prefix_len = net.prefix() as u32;
+                        let key = Key::new(prefix_len, net.ip().octets());
+                        let _ = trie6.insert(&key, geo_id, 0);
+                        count6 += 1;
+                    }
+                    Err(_) => continue,
                 }
             }
         }
     }
 
-    info!("Loaded {} country prefixes into GEO_COUNTRY_MAP", count);
-    Ok(count)
+    info!(
+        "Loaded {} IPv4 + {} IPv6 country prefixes",
+        count4, count6
+    );
+    Ok((count4, count6))
 }
 
-pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<usize> {
+pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
     let reader = maxminddb::Reader::from_source(ASN_MMDB.to_vec())
         .context("Failed to load embedded ASN mmdb")?;
 
-    let map = ebpf
-        .map_mut("GEO_ASN_MAP")
-        .context("GEO_ASN_MAP not found")?;
-    let mut trie: LpmTrie<_, u32, u32> =
-        LpmTrie::try_from(map).context("Failed to open GEO_ASN_MAP")?;
+    let map4 = ebpf.take_map("GEO_ASN_MAP").context("GEO_ASN_MAP not found")?;
+    let mut trie4: LpmTrie<_, u32, u32> =
+        LpmTrie::try_from(map4).context("Failed to open GEO_ASN_MAP")?;
 
-    let mut count = 0usize;
+    let map6 = ebpf.take_map("GEO_ASN_MAP6").context("GEO_ASN_MAP6 not found")?;
+    let mut trie6: LpmTrie<_, [u8; 16], u32> =
+        LpmTrie::try_from(map6).context("Failed to open GEO_ASN_MAP6")?;
+
+    let mut count4 = 0usize;
+    let mut count6 = 0usize;
 
     for result in reader.networks(Default::default())? {
         let item = result?;
         let record: Option<geoip2::Asn> = item.decode()?;
         if let Some(record) = record {
             if let Some(asn) = record.autonomous_system_number {
-                if let Ok(IpNetwork::V4(net)) = item.network() {
-                    let prefix_len = net.prefix() as u32;
-                    let ip_be = u32::from(net.ip()).to_be();
-                    let key = Key::new(prefix_len, ip_be);
-                    let asn_id = 0x80000000 | asn;
-                    let _ = trie.insert(&key, asn_id, 0);
-                    count += 1;
+                let asn_id = 0x80000000 | asn;
+                match item.network() {
+                    Ok(IpNetwork::V4(net)) => {
+                        let prefix_len = net.prefix() as u32;
+                        let ip_be = u32::from(net.ip()).to_be();
+                        let key = Key::new(prefix_len, ip_be);
+                        let _ = trie4.insert(&key, asn_id, 0);
+                        count4 += 1;
+                    }
+                    Ok(IpNetwork::V6(net)) => {
+                        let prefix_len = net.prefix() as u32;
+                        let key = Key::new(prefix_len, net.ip().octets());
+                        let _ = trie6.insert(&key, asn_id, 0);
+                        count6 += 1;
+                    }
+                    Err(_) => continue,
                 }
             }
         }
     }
 
-    info!("Loaded {} ASN prefixes into GEO_ASN_MAP", count);
-    Ok(count)
+    info!("Loaded {} IPv4 + {} IPv6 ASN prefixes", count4, count6);
+    Ok((count4, count6))
 }
 
 pub fn set_country_policy(action: u32, code: &str) -> Result<()> {

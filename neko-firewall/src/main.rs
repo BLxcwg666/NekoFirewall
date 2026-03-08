@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use log::info;
 use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::signal;
 
 fn set_title(title: &str) {
@@ -116,23 +116,52 @@ fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
 }
 
 fn print_packet_log(log: &PacketLog) {
-    let src = Ipv4Addr::from(log.src_addr.to_be());
-    let dst = Ipv4Addr::from(log.dst_addr.to_be());
-    let action = if log.action == 1 { "DROP" } else { "PASS" };
-    match log.protocol {
-        1 => println!(
-            "[{}] ICMP {} -> {} (type {})",
-            action, src, dst, log.dst_port
-        ),
-        6 => println!(
-            "[{}] TCP {}:{} -> {}:{}",
-            action, src, log.src_port, dst, log.dst_port
-        ),
-        17 => println!(
-            "[{}] UDP {}:{} -> {}:{}",
-            action, src, log.src_port, dst, log.dst_port
-        ),
-        p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
+    let action = if log.action == ACTION_DROP as u8 {
+        "DROP"
+    } else {
+        "PASS"
+    };
+
+    if log.family == 6 {
+        // IPv6
+        let src = Ipv6Addr::from(log.src_addr);
+        let dst = Ipv6Addr::from(log.dst_addr);
+        match log.protocol {
+            58 => println!(
+                "[{}] ICMPv6 {} -> {} (type {})",
+                action, src, dst, log.dst_port
+            ),
+            6 => println!(
+                "[{}] TCP [{}]:{} -> [{}]:{}",
+                action, src, log.src_port, dst, log.dst_port
+            ),
+            17 => println!(
+                "[{}] UDP [{}]:{} -> [{}]:{}",
+                action, src, log.src_port, dst, log.dst_port
+            ),
+            p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
+        }
+    } else {
+        // IPv4 — address stored in first 4 bytes
+        let src_bytes = [log.src_addr[0], log.src_addr[1], log.src_addr[2], log.src_addr[3]];
+        let src = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(src_bytes)));
+        let dst_bytes = [log.dst_addr[0], log.dst_addr[1], log.dst_addr[2], log.dst_addr[3]];
+        let dst = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(dst_bytes)));
+        match log.protocol {
+            1 => println!(
+                "[{}] ICMP {} -> {} (type {})",
+                action, src, dst, log.dst_port
+            ),
+            6 => println!(
+                "[{}] TCP {}:{} -> {}:{}",
+                action, src, log.src_port, dst, log.dst_port
+            ),
+            17 => println!(
+                "[{}] UDP {}:{} -> {}:{}",
+                action, src, log.src_port, dst, log.dst_port
+            ),
+            p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
+        }
     }
 }
 
@@ -175,11 +204,11 @@ async fn main() -> Result<()> {
             loader::reset_runtime_maps(&mut ebpf)?;
 
             println!("Loading GeoIP databases...");
-            let geo_count = geo::load_geo_map(&mut ebpf)?;
-            let asn_count = geo::load_asn_map(&mut ebpf)?;
+            let (geo4, geo6) = geo::load_geo_map(&mut ebpf)?;
+            let (asn4, asn6) = geo::load_asn_map(&mut ebpf)?;
             println!(
-                "  Loaded {} country + {} ASN prefixes",
-                geo_count, asn_count
+                "  Loaded {} IPv4 + {} IPv6 country, {} IPv4 + {} IPv6 ASN prefixes",
+                geo4, geo6, asn4, asn6
             );
 
             let cfg = config::Config::load()?;
@@ -193,7 +222,7 @@ async fn main() -> Result<()> {
             loader::attach(&mut ebpf, &iface)?;
 
             set_title(&format!("NekoFirewall | {} · whitelist", iface));
-            println!("Firewall running on {} (whitelist mode)", iface);
+            println!("Firewall running on {} (whitelist mode, IPv4+IPv6)", iface);
             println!("  Use 'nf stop -i {}' for emergency detach", iface);
             println!("Press Ctrl+C to stop.");
             spawn_event_readers(&mut ebpf)?;
@@ -208,8 +237,9 @@ async fn main() -> Result<()> {
             }
             AllowTarget::Port { proto, port } => {
                 rule::allow_port(&proto, port)?;
-                if proto.eq_ignore_ascii_case("icmp") {
-                    println!("Whitelisted: icmp type {}", port);
+                let pnum = rule::parse_proto(&proto)?;
+                if pnum == 1 || pnum == 58 {
+                    println!("Whitelisted: {} type {}", proto, port);
                 } else {
                     println!("Whitelisted: {}/{}", port, proto);
                 }
