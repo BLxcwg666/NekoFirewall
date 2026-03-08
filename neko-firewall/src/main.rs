@@ -165,11 +165,35 @@ fn print_packet_log(log: &PacketLog) {
     }
 }
 
-fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
-    let ssh_port = std::env::var("SSH_CONNECTION")
+fn detect_ssh_port() -> u16 {
+    // 1. Try SSH_CONNECTION env (available in SSH sessions)
+    if let Some(port) = std::env::var("SSH_CONNECTION")
         .ok()
         .and_then(|conn| conn.split_whitespace().nth(3).and_then(|p| p.parse::<u16>().ok()))
-        .unwrap_or(22);
+    {
+        return port;
+    }
+
+    // 2. Parse sshd_config (works under systemd)
+    if let Ok(content) = std::fs::read_to_string("/etc/ssh/sshd_config") {
+        for line in content.lines().rev() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("Port") {
+                if let Some(port) = rest.trim().parse::<u16>().ok() {
+                    return port;
+                }
+            }
+        }
+    }
+
+    22
+}
+
+fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
+    let ssh_port = detect_ssh_port();
 
     let map = ebpf.map("ALLOWED_PORTS").expect("ALLOWED_PORTS map not found");
     let map: aya::maps::HashMap<_, u32, u32> =
