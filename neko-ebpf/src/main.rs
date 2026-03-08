@@ -498,31 +498,42 @@ fn ipv6_prefix_match(addr: &[u8; 16], rule_addr: &[u8; 16], prefix_len: u8) -> b
     if prefix_len == 0 {
         return true;
     }
-    if prefix_len > 128 {
-        return false;
-    }
-    let full_bytes = (prefix_len / 8) as usize;
-    let remaining_bits = prefix_len % 8;
+    let pl = prefix_len as u32;
 
-    let mut i = 0usize;
-    while i < 16 {
-        if i >= full_bytes {
-            break;
-        }
-        if addr[i] != rule_addr[i] {
-            return false;
-        }
-        i += 1;
+    let a0 = u32::from_be_bytes([addr[0], addr[1], addr[2], addr[3]]);
+    let r0 = u32::from_be_bytes([rule_addr[0], rule_addr[1], rule_addr[2], rule_addr[3]]);
+    if pl >= 32 {
+        if a0 != r0 { return false; }
+    } else {
+        let mask = !0u32 << (32 - pl);
+        return (a0 & mask) == (r0 & mask);
     }
 
-    if remaining_bits > 0 && full_bytes < 16 {
-        let mask = !0u8 << (8 - remaining_bits);
-        if (addr[full_bytes] & mask) != (rule_addr[full_bytes] & mask) {
-            return false;
-        }
+    let a1 = u32::from_be_bytes([addr[4], addr[5], addr[6], addr[7]]);
+    let r1 = u32::from_be_bytes([rule_addr[4], rule_addr[5], rule_addr[6], rule_addr[7]]);
+    if pl >= 64 {
+        if a1 != r1 { return false; }
+    } else {
+        let mask = !0u32 << (64 - pl);
+        return (a1 & mask) == (r1 & mask);
     }
 
-    true
+    let a2 = u32::from_be_bytes([addr[8], addr[9], addr[10], addr[11]]);
+    let r2 = u32::from_be_bytes([rule_addr[8], rule_addr[9], rule_addr[10], rule_addr[11]]);
+    if pl >= 96 {
+        if a2 != r2 { return false; }
+    } else {
+        let mask = !0u32 << (96 - pl);
+        return (a2 & mask) == (r2 & mask);
+    }
+
+    let a3 = u32::from_be_bytes([addr[12], addr[13], addr[14], addr[15]]);
+    let r3 = u32::from_be_bytes([rule_addr[12], rule_addr[13], rule_addr[14], rule_addr[15]]);
+    if pl >= 128 {
+        return a3 == r3;
+    }
+    let mask = !0u32 << (128 - pl);
+    (a3 & mask) == (r3 & mask)
 }
 
 #[inline(always)]
