@@ -31,10 +31,10 @@ static ALLOWED_IPS: LpmTrie<u32, u32> = LpmTrie::pinned(65536, 0);
 static CONNTRACK: LruHashMap<ConnTrackKey, u64> = LruHashMap::pinned(65536, 0);
 
 #[map]
-static GEO_COUNTRY_MAP: LpmTrie<u32, u32> = LpmTrie::pinned(524288, 0);
+static GEO_COUNTRY_MAP: LpmTrie<u32, u32> = LpmTrie::pinned(2097152, 0);
 
 #[map]
-static GEO_ASN_MAP: LpmTrie<u32, u32> = LpmTrie::pinned(524288, 0);
+static GEO_ASN_MAP: LpmTrie<u32, u32> = LpmTrie::pinned(2097152, 0);
 
 #[map]
 static ALLOWED_IPS6: LpmTrie<[u8; 16], u32> = LpmTrie::pinned(65536, 0);
@@ -43,10 +43,10 @@ static ALLOWED_IPS6: LpmTrie<[u8; 16], u32> = LpmTrie::pinned(65536, 0);
 static CONNTRACK6: LruHashMap<ConnTrackKey6, u64> = LruHashMap::pinned(65536, 0);
 
 #[map]
-static GEO_COUNTRY_MAP6: LpmTrie<[u8; 16], u32> = LpmTrie::pinned(524288, 0);
+static GEO_COUNTRY_MAP6: LpmTrie<[u8; 16], u32> = LpmTrie::pinned(2097152, 0);
 
 #[map]
-static GEO_ASN_MAP6: LpmTrie<[u8; 16], u32> = LpmTrie::pinned(524288, 0);
+static GEO_ASN_MAP6: LpmTrie<[u8; 16], u32> = LpmTrie::pinned(2097152, 0);
 
 #[map]
 static ALLOWED_PORTS: HashMap<u32, u32> = HashMap::pinned(1024, 0);

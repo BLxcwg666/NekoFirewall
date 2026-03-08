@@ -41,6 +41,8 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
 
     let mut count4 = 0usize;
     let mut count6 = 0usize;
+    let mut fail4 = 0usize;
+    let mut fail6 = 0usize;
 
     for result in reader.networks(Default::default())? {
         let item = result?;
@@ -56,14 +58,20 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
                         let prefix_len = net.prefix() as u32;
                         let ip_be = u32::from(net.ip()).to_be();
                         let key = Key::new(prefix_len, ip_be);
-                        let _ = trie4.insert(&key, geo_id, 0);
-                        count4 += 1;
+                        if trie4.insert(&key, geo_id, 0).is_ok() {
+                            count4 += 1;
+                        } else {
+                            fail4 += 1;
+                        }
                     }
                     Ok(IpNetwork::V6(net)) => {
                         let prefix_len = net.prefix() as u32;
                         let key = Key::new(prefix_len, net.ip().octets());
-                        let _ = trie6.insert(&key, geo_id, 0);
-                        count6 += 1;
+                        if trie6.insert(&key, geo_id, 0).is_ok() {
+                            count6 += 1;
+                        } else {
+                            fail6 += 1;
+                        }
                     }
                     Err(_) => continue,
                 }
@@ -71,6 +79,12 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
         }
     }
 
+    if fail4 > 0 || fail6 > 0 {
+        log::warn!(
+            "Country map insert failures: {} IPv4, {} IPv6 (map full?)",
+            fail4, fail6
+        );
+    }
     info!(
         "Loaded {} IPv4 + {} IPv6 country prefixes",
         count4, count6
@@ -92,6 +106,8 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
 
     let mut count4 = 0usize;
     let mut count6 = 0usize;
+    let mut fail4 = 0usize;
+    let mut fail6 = 0usize;
 
     for result in reader.networks(Default::default())? {
         let item = result?;
@@ -104,14 +120,20 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
                         let prefix_len = net.prefix() as u32;
                         let ip_be = u32::from(net.ip()).to_be();
                         let key = Key::new(prefix_len, ip_be);
-                        let _ = trie4.insert(&key, asn_id, 0);
-                        count4 += 1;
+                        if trie4.insert(&key, asn_id, 0).is_ok() {
+                            count4 += 1;
+                        } else {
+                            fail4 += 1;
+                        }
                     }
                     Ok(IpNetwork::V6(net)) => {
                         let prefix_len = net.prefix() as u32;
                         let key = Key::new(prefix_len, net.ip().octets());
-                        let _ = trie6.insert(&key, asn_id, 0);
-                        count6 += 1;
+                        if trie6.insert(&key, asn_id, 0).is_ok() {
+                            count6 += 1;
+                        } else {
+                            fail6 += 1;
+                        }
                     }
                     Err(_) => continue,
                 }
@@ -119,6 +141,12 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
         }
     }
 
+    if fail4 > 0 || fail6 > 0 {
+        log::warn!(
+            "ASN map insert failures: {} IPv4, {} IPv6 (map full?)",
+            fail4, fail6
+        );
+    }
     info!("Loaded {} IPv4 + {} IPv6 ASN prefixes", count4, count6);
     Ok((count4, count6))
 }
