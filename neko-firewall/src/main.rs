@@ -10,7 +10,7 @@ use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use log::info;
 use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::signal;
 
 fn set_title(title: &str) {
@@ -215,7 +215,10 @@ fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
     let tcp_wildcard = 6u32 << 16;
     let ssh_key = (6u32 << 16) | ssh_port as u32;
 
-    if map.get(&tcp_wildcard, 0).is_ok() || map.get(&ssh_key, 0).is_ok() {
+    if map.get(&tcp_wildcard, 0).is_ok()
+        || map.get(&ssh_key, 0).is_ok()
+        || ssh_allowed_by_compound_rules(ssh_port)
+    {
         return;
     }
 
@@ -227,6 +230,67 @@ fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
     eprintln!("!  You may lose SSH access after firewall attaches");
     eprintln!("!  Run: nf allow port tcp {}", ssh_port);
     eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+}
+
+fn ssh_allowed_by_compound_rules(ssh_port: u16) -> bool {
+    let Ok(cfg) = config::Config::load() else {
+        return false;
+    };
+    let ssh_family = detect_ssh_family();
+    cfg.rules
+        .iter()
+        .any(|rule| compound_rule_allows_ssh(rule, ssh_port, ssh_family))
+}
+
+fn detect_ssh_family() -> Option<u8> {
+    let server_ip = std::env::var("SSH_CONNECTION")
+        .ok()
+        .and_then(|conn| conn.split_whitespace().nth(2).map(str::to_owned))?;
+    let ip: IpAddr = server_ip.parse().ok()?;
+    Some(match ip {
+        IpAddr::V4(_) => 4,
+        IpAddr::V6(_) => 6,
+    })
+}
+
+fn compound_rule_allows_ssh(
+    rule_entry: &config::CompoundRuleEntry,
+    ssh_port: u16,
+    ssh_family: Option<u8>,
+) -> bool {
+    if !rule_entry.action.eq_ignore_ascii_case("allow") {
+        return false;
+    }
+
+    if rule_entry.proto.is_none() && rule_entry.port.is_none() {
+        return false;
+    }
+
+    if let Some(proto) = &rule_entry.proto {
+        if !proto.eq_ignore_ascii_case("tcp") {
+            return false;
+        }
+    }
+
+    if let Some(port) = rule_entry.port {
+        if port != ssh_port {
+            return false;
+        }
+    }
+
+    let Some(ssh_family) = ssh_family else {
+        return true;
+    };
+
+    let Some(ip) = rule_entry.ip.as_deref() else {
+        return true;
+    };
+
+    match rule::parse_cidr(ip) {
+        Ok(rule::CidrAddr::V4(_, _)) => ssh_family == 4,
+        Ok(rule::CidrAddr::V6(_, _)) => ssh_family == 6,
+        Err(_) => false,
+    }
 }
 
 #[tokio::main]
