@@ -227,6 +227,9 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
         IpProto::Ipv6Icmp => {
             let icmp_type_ptr: *const u8 = ptr_at(start, end, transport_offset)?;
             let icmp_type = unsafe { *icmp_type_ptr };
+            if icmpv6_type_must_pass(icmp_type) {
+                return Ok(xdp_action::XDP_PASS);
+            }
             (0u16, icmp_type as u16, 0u16, 0u16)
         }
         _ => return Ok(xdp_action::XDP_PASS),
@@ -841,6 +844,11 @@ fn proto_to_num(proto: IpProto) -> u8 {
         IpProto::Ipv6Icmp => 58,
         _ => 0,
     }
+}
+
+#[inline(always)]
+fn icmpv6_type_must_pass(icmp_type: u8) -> bool {
+    matches!(icmp_type, 1 | 2 | 3 | 4 | 133 | 134 | 135 | 136 | 137)
 }
 
 #[inline(always)]
