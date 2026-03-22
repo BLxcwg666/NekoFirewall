@@ -143,9 +143,19 @@ fn print_packet_log(log: &PacketLog) {
         }
     } else {
         // IPv4 — address stored in first 4 bytes
-        let src_bytes = [log.src_addr[0], log.src_addr[1], log.src_addr[2], log.src_addr[3]];
+        let src_bytes = [
+            log.src_addr[0],
+            log.src_addr[1],
+            log.src_addr[2],
+            log.src_addr[3],
+        ];
         let src = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(src_bytes)));
-        let dst_bytes = [log.dst_addr[0], log.dst_addr[1], log.dst_addr[2], log.dst_addr[3]];
+        let dst_bytes = [
+            log.dst_addr[0],
+            log.dst_addr[1],
+            log.dst_addr[2],
+            log.dst_addr[3],
+        ];
         let dst = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(dst_bytes)));
         match log.protocol {
             1 => println!(
@@ -167,10 +177,11 @@ fn print_packet_log(log: &PacketLog) {
 
 fn detect_ssh_port() -> u16 {
     // 1. Try SSH_CONNECTION env (available in SSH sessions)
-    if let Some(port) = std::env::var("SSH_CONNECTION")
-        .ok()
-        .and_then(|conn| conn.split_whitespace().nth(3).and_then(|p| p.parse::<u16>().ok()))
-    {
+    if let Some(port) = std::env::var("SSH_CONNECTION").ok().and_then(|conn| {
+        conn.split_whitespace()
+            .nth(3)
+            .and_then(|p| p.parse::<u16>().ok())
+    }) {
         return port;
     }
 
@@ -195,7 +206,9 @@ fn detect_ssh_port() -> u16 {
 fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
     let ssh_port = detect_ssh_port();
 
-    let map = ebpf.map("ALLOWED_PORTS").expect("ALLOWED_PORTS map not found");
+    let map = ebpf
+        .map("ALLOWED_PORTS")
+        .expect("ALLOWED_PORTS map not found");
     let map: aya::maps::HashMap<_, u32, u32> =
         aya::maps::HashMap::try_from(map).expect("ALLOWED_PORTS type mismatch");
 
@@ -207,7 +220,10 @@ fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
     }
 
     eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    eprintln!("!  WARNING: SSH port {}/tcp is NOT in allowed rules", ssh_port);
+    eprintln!(
+        "!  WARNING: SSH port {}/tcp is NOT in allowed rules",
+        ssh_port
+    );
     eprintln!("!  You may lose SSH access after firewall attaches");
     eprintln!("!  Run: nf allow port tcp {}", ssh_port);
     eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
@@ -216,10 +232,7 @@ fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-    set_title(&format!(
-        "NekoFirewall v{}",
-        env!("CARGO_PKG_VERSION")
-    ));
+    set_title(&format!("NekoFirewall v{}", env!("CARGO_PKG_VERSION")));
     let cli = Cli::parse();
 
     match cli.command {

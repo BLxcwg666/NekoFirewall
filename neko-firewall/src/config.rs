@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use aya::maps::{lpm_trie::Key, Array, HashMap};
 use neko_common::{
-    CompoundRule, ACTION_DROP, ACTION_PASS, MAX_COMPOUND_RULES,
-    MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
+    CompoundRule, ACTION_DROP, ACTION_PASS, FLAG_EMIT_EVENTS, MATCH_ASN, MATCH_COUNTRY, MATCH_IP,
+    MATCH_PORT, MATCH_PROTO, MAX_COMPOUND_RULES,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::{geo, loader, rule::{self, CidrAddr}};
+use crate::{
+    geo, loader,
+    rule::{self, CidrAddr},
+};
 
 const CONFIG_DIR: &str = "/etc/neko-firewall";
 const CONFIG_PATH: &str = "/etc/neko-firewall/rules.toml";
@@ -132,8 +135,10 @@ impl Config {
         }
 
         // Apply geo policies
-        if !self.allow.countries.is_empty() || !self.block.countries.is_empty()
-            || !self.allow.asns.is_empty() || !self.block.asns.is_empty()
+        if !self.allow.countries.is_empty()
+            || !self.block.countries.is_empty()
+            || !self.allow.asns.is_empty()
+            || !self.block.asns.is_empty()
         {
             let mut map: HashMap<_, u32, u32> = loader::open_pinned_hashmap("GEO_POLICY")?;
             for code in &self.allow.countries {
@@ -154,23 +159,84 @@ impl Config {
             }
         }
 
-        // Apply compound rules
-        if !self.rules.is_empty() {
-            let map = loader::open_pinned_map("RULES")?;
-            let mut arr: Array<_, CompoundRule> = Array::try_from(map)
-                .map_err(|e| anyhow::anyhow!("Failed to open RULES: {:?}", e))?;
-            for (i, entry) in self.rules.iter().enumerate() {
-                if i as u32 >= MAX_COMPOUND_RULES {
-                    eprintln!("  Warning: too many compound rules, max {}", MAX_COMPOUND_RULES);
-                    break;
+        self.apply_compound_rules()?;
+
+        Ok(())
+    }
+
+    pub fn apply_compound_rules(&self) -> Result<()> {
+        let map_v4 = loader::open_pinned_map("RULES_V4")?;
+        let mut arr_v4: Array<_, CompoundRule> = Array::try_from(map_v4)
+            .map_err(|e| anyhow::anyhow!("Failed to open RULES_V4: {:?}", e))?;
+        let map_v6 = loader::open_pinned_map("RULES_V6")?;
+        let mut arr_v6: Array<_, CompoundRule> = Array::try_from(map_v6)
+            .map_err(|e| anyhow::anyhow!("Failed to open RULES_V6: {:?}", e))?;
+
+        let mut next_v4 = 0u32;
+        let mut next_v6 = 0u32;
+
+        for (i, entry) in self.rules.iter().enumerate() {
+            let Some(rule) = entry.to_bpf_rule() else {
+                eprintln!("  Warning: skipping invalid compound rule #{}", i);
+                continue;
+            };
+
+            match rule.family {
+                4 => {
+                    if next_v4 >= MAX_COMPOUND_RULES {
+                        eprintln!(
+                            "  Warning: too many IPv4 compound rules, max {}",
+                            MAX_COMPOUND_RULES
+                        );
+                        continue;
+                    }
+                    arr_v4.set(next_v4, rule, 0).map_err(|e| {
+                        anyhow::anyhow!("Failed to set RULES_V4[{}]: {:?}", next_v4, e)
+                    })?;
+                    next_v4 += 1;
                 }
-                if let Some(rule) = entry.to_bpf_rule() {
-                    arr.set(i as u32, rule, 0)
-                        .map_err(|e| anyhow::anyhow!("Failed to set RULES[{}]: {:?}", i, e))?;
-                } else {
-                    eprintln!("  Warning: skipping invalid compound rule #{}", i);
+                6 => {
+                    if next_v6 >= MAX_COMPOUND_RULES {
+                        eprintln!(
+                            "  Warning: too many IPv6 compound rules, max {}",
+                            MAX_COMPOUND_RULES
+                        );
+                        continue;
+                    }
+                    arr_v6.set(next_v6, rule, 0).map_err(|e| {
+                        anyhow::anyhow!("Failed to set RULES_V6[{}]: {:?}", next_v6, e)
+                    })?;
+                    next_v6 += 1;
+                }
+                _ => {
+                    if next_v4 >= MAX_COMPOUND_RULES || next_v6 >= MAX_COMPOUND_RULES {
+                        eprintln!(
+                            "  Warning: too many compound rules, max {}",
+                            MAX_COMPOUND_RULES
+                        );
+                        continue;
+                    }
+                    arr_v4.set(next_v4, rule, 0).map_err(|e| {
+                        anyhow::anyhow!("Failed to set RULES_V4[{}]: {:?}", next_v4, e)
+                    })?;
+                    arr_v6.set(next_v6, rule, 0).map_err(|e| {
+                        anyhow::anyhow!("Failed to set RULES_V6[{}]: {:?}", next_v6, e)
+                    })?;
+                    next_v4 += 1;
+                    next_v6 += 1;
                 }
             }
+        }
+
+        for i in next_v4..MAX_COMPOUND_RULES {
+            arr_v4
+                .set(i, CompoundRule::default(), 0)
+                .map_err(|e| anyhow::anyhow!("Failed to clear RULES_V4[{}]: {:?}", i, e))?;
+        }
+        for i in next_v6..MAX_COMPOUND_RULES {
+            arr_v6
+                .set(i, CompoundRule::default(), 0)
+                .map_err(|e| anyhow::anyhow!("Failed to clear RULES_V6[{}]: {:?}", i, e))?;
         }
 
         Ok(())
@@ -185,6 +251,21 @@ impl Config {
             + self.block.countries.len()
             + self.block.asns.len()
             + self.rules.len()
+    }
+
+    pub fn runtime_policy_flags(&self) -> u32 {
+        0
+    }
+
+    pub fn sync_runtime_policy_flags(&self) -> Result<()> {
+        let Ok(mut map) = loader::open_pinned_hashmap::<u32, u32>("RUNTIME_FLAGS") else {
+            return Ok(());
+        };
+        let key = 0u32;
+        let current = map.get(&key, 0).ok().unwrap_or(0);
+        let flags = self.runtime_policy_flags() | (current & FLAG_EMIT_EVENTS);
+        map.insert(key, flags, 0)?;
+        Ok(())
     }
 
     pub fn add_ip(&mut self, cidr: &str) {
@@ -279,7 +360,7 @@ impl CompoundRuleEntry {
         }
     }
 
-    fn to_bpf_rule(&self) -> Option<CompoundRule> {
+    pub(crate) fn to_bpf_rule(&self) -> Option<CompoundRule> {
         let action = match self.action.as_str() {
             "allow" => ACTION_PASS,
             "drop" | "block" => ACTION_DROP,

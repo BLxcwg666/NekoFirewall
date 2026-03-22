@@ -2,6 +2,7 @@
 
 pub const ACTION_PASS: u32 = 0;
 pub const ACTION_DROP: u32 = 1;
+pub const FLAG_EMIT_EVENTS: u32 = 1;
 
 // CompoundRule match_fields bitmask
 pub const MATCH_PROTO: u32 = 1;
@@ -11,6 +12,13 @@ pub const MATCH_ASN: u32 = 8;
 pub const MATCH_IP: u32 = 16;
 
 pub const MAX_COMPOUND_RULES: u32 = 128;
+pub const RULES_PER_STAGE: u32 = 16;
+pub const RULE_STAGE_COUNT: u32 = (MAX_COMPOUND_RULES + RULES_PER_STAGE - 1) / RULES_PER_STAGE;
+pub const RULE_PIPELINE_V4_BASE: u32 = 0;
+pub const RULE_PIPELINE_V4_POST: u32 = RULE_PIPELINE_V4_BASE + RULE_STAGE_COUNT;
+pub const RULE_PIPELINE_V6_BASE: u32 = RULE_PIPELINE_V4_POST + 1;
+pub const RULE_PIPELINE_V6_POST: u32 = RULE_PIPELINE_V6_BASE + RULE_STAGE_COUNT;
+pub const RULE_PIPELINE_SIZE: u32 = RULE_PIPELINE_V6_POST + 1;
 
 /// Connection tracking key for IPv4 (5-tuple, network byte order for IPs/ports).
 #[repr(C)]
@@ -34,6 +42,36 @@ pub struct ConnTrackKey6 {
     pub dst_port: u16,
     pub proto: u8,
     pub _pad: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PacketCtxV4 {
+    pub src_addr: u32,
+    pub dst_addr: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub ct_src_port: u16,
+    pub ct_dst_port: u16,
+    pub proto: u8,
+    pub _pad0: u8,
+    pub country_id: u32,
+    pub asn_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PacketCtxV6 {
+    pub src_addr: [u8; 16],
+    pub dst_addr: [u8; 16],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub ct_src_port: u16,
+    pub ct_dst_port: u16,
+    pub proto: u8,
+    pub _pad0: u8,
+    pub country_id: u32,
+    pub asn_id: u32,
 }
 
 /// Packet event log entry, shared between kernel and userspace via PerfEventArray.
@@ -97,3 +135,9 @@ unsafe impl aya::Pod for ConnTrackKey6 {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for CompoundRule {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PacketCtxV4 {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PacketCtxV6 {}

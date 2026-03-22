@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use aya::{
     maps::{
         lpm_trie::{Key, LpmTrie},
-        Array, HashMap, Map, MapData, MapInfo, MapType,
+        Array, HashMap, Map, MapData, MapInfo, MapType, ProgramArray,
     },
     programs::{
         tc::{self, SchedClassifier, TcAttachType},
@@ -11,15 +11,16 @@ use aya::{
     Ebpf, EbpfLoader, Pod,
 };
 use log::info;
-use neko_common::{CompoundRule, MAX_COMPOUND_RULES};
+use neko_common::{
+    CompoundRule, MAX_COMPOUND_RULES, RULE_PIPELINE_SIZE, RULE_PIPELINE_V4_BASE,
+    RULE_PIPELINE_V4_POST, RULE_PIPELINE_V6_BASE, RULE_PIPELINE_V6_POST, RULE_STAGE_COUNT,
+};
 use std::process::Command;
 
-const EBPF_OBJ: &[u8] =
-    include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
+const EBPF_OBJ: &[u8] = include_bytes!("../../target/bpfel-unknown-none/release/neko-ebpf");
 const PIN_PATH: &str = "/sys/fs/bpf/neko";
 
 pub fn load(_iface: &str) -> Result<Ebpf> {
-
     std::fs::create_dir_all(PIN_PATH)
         .with_context(|| format!("Failed to create pin path {}", PIN_PATH))?;
 
@@ -33,13 +34,15 @@ pub fn load(_iface: &str) -> Result<Ebpf> {
         log::warn!("Failed to init eBPF logger: {}", e);
     }
 
-    // Load programs into kernel (but don't attach yet)
-    let xdp: &mut Xdp = ebpf
-        .program_mut("neko_firewall")
-        .unwrap()
-        .try_into()
-        .context("Failed to get XDP program")?;
-    xdp.load().context("Failed to load XDP program")?;
+    load_xdp_program(&mut ebpf, "neko_firewall")?;
+    for stage in 0..RULE_STAGE_COUNT {
+        load_xdp_program(&mut ebpf, &format!("compound_v4_stage_{}", stage))?;
+    }
+    load_xdp_program(&mut ebpf, "post_rules_v4")?;
+    for stage in 0..RULE_STAGE_COUNT {
+        load_xdp_program(&mut ebpf, &format!("compound_v6_stage_{}", stage))?;
+    }
+    load_xdp_program(&mut ebpf, "post_rules_v6")?;
 
     let tc_prog: &mut SchedClassifier = ebpf
         .program_mut("neko_egress")
@@ -47,6 +50,8 @@ pub fn load(_iface: &str) -> Result<Ebpf> {
         .try_into()
         .context("Failed to get TC program")?;
     tc_prog.load().context("Failed to load TC program")?;
+
+    install_rule_pipeline(&mut ebpf)?;
 
     Ok(ebpf)
 }
@@ -83,7 +88,9 @@ pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_ASN_MAP")?;
     clear_lpm_trie::<[u8; 16], u32>(ebpf, "GEO_COUNTRY_MAP6")?;
     clear_lpm_trie::<[u8; 16], u32>(ebpf, "GEO_ASN_MAP6")?;
-    clear_array::<CompoundRule>(ebpf, "RULES")?;
+    clear_array::<CompoundRule>(ebpf, "RULES_V4")?;
+    clear_array::<CompoundRule>(ebpf, "RULES_V6")?;
+    set_runtime_flags_in_ebpf(ebpf, 0)?;
     Ok(())
 }
 
@@ -101,7 +108,12 @@ pub fn cleanup_pins() {
         "GEO_ASN_MAP6",
         "GEO_POLICY",
         "GEO_MAP",
-        "RULES",
+        "RULES_V4",
+        "RULES_V6",
+        "PACKET_CTX_V4",
+        "PACKET_CTX_V6",
+        "RULE_PIPELINE",
+        "RUNTIME_FLAGS",
     ] {
         let pin = format!("{}/{}", PIN_PATH, name);
         std::fs::remove_file(&pin).ok();
@@ -165,6 +177,29 @@ pub fn open_pinned_perf_event_array(name: &str) -> Result<Map> {
     }
 }
 
+pub fn set_runtime_flags_in_ebpf(ebpf: &mut Ebpf, flags: u32) -> Result<()> {
+    let map = ebpf
+        .map_mut("RUNTIME_FLAGS")
+        .context("RUNTIME_FLAGS map not found")?;
+    let mut typed: HashMap<_, u32, u32> = HashMap::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open RUNTIME_FLAGS as HashMap: {:?}", e))?;
+    typed.insert(0, flags, 0)?;
+    Ok(())
+}
+
+pub fn set_runtime_flag(flag: u32, enabled: bool) -> Result<()> {
+    let mut map = open_pinned_hashmap::<u32, u32>("RUNTIME_FLAGS")?;
+    let key = 0u32;
+    let current = map.get(&key, 0).ok().unwrap_or(0);
+    let next = if enabled {
+        current | flag
+    } else {
+        current & !flag
+    };
+    map.insert(key, next, 0)?;
+    Ok(())
+}
+
 pub fn open_pinned_map(name: &str) -> Result<Map> {
     let pin = format!("{}/{}", PIN_PATH, name);
     let data = MapData::from_pin(&pin)
@@ -177,6 +212,7 @@ pub fn open_pinned_map(name: &str) -> Result<Map> {
         MapType::LpmTrie => Map::LpmTrie(data),
         MapType::PerfEventArray => Map::PerfEventArray(data),
         MapType::Array => Map::Array(data),
+        MapType::ProgramArray => Map::ProgramArray(data),
         other => {
             return Err(anyhow::anyhow!(
                 "Unsupported pinned map type {:?} for {}",
@@ -215,5 +251,72 @@ fn clear_array<V: Pod + Default>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
     for i in 0..MAX_COMPOUND_RULES {
         let _ = typed.set(i, V::default(), 0);
     }
+    Ok(())
+}
+
+fn load_xdp_program(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+    let prog: &mut Xdp = ebpf
+        .program_mut(name)
+        .with_context(|| format!("{} program not found", name))?
+        .try_into()
+        .with_context(|| format!("Failed to get XDP program {}", name))?;
+    prog.load()
+        .with_context(|| format!("Failed to load XDP program {}", name))?;
+    Ok(())
+}
+
+fn install_rule_pipeline(ebpf: &mut Ebpf) -> Result<()> {
+    let map = ebpf
+        .take_map("RULE_PIPELINE")
+        .context("RULE_PIPELINE map not found")?;
+    let mut pipeline = ProgramArray::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open RULE_PIPELINE as ProgramArray: {:?}", e))?;
+
+    for stage in 0..RULE_STAGE_COUNT {
+        let name = format!("compound_v4_stage_{}", stage);
+        let fd = ebpf
+            .program(&name)
+            .with_context(|| format!("{} program not found", name))?
+            .fd()
+            .with_context(|| format!("{} program fd unavailable", name))?;
+        pipeline
+            .set(RULE_PIPELINE_V4_BASE + stage, fd, 0)
+            .with_context(|| format!("Failed to install {} in RULE_PIPELINE", name))?;
+    }
+
+    let post_v4 = ebpf
+        .program("post_rules_v4")
+        .context("post_rules_v4 program not found")?
+        .fd()
+        .context("post_rules_v4 program fd unavailable")?;
+    pipeline
+        .set(RULE_PIPELINE_V4_POST, post_v4, 0)
+        .context("Failed to install post_rules_v4 in RULE_PIPELINE")?;
+
+    for stage in 0..RULE_STAGE_COUNT {
+        let name = format!("compound_v6_stage_{}", stage);
+        let fd = ebpf
+            .program(&name)
+            .with_context(|| format!("{} program not found", name))?
+            .fd()
+            .with_context(|| format!("{} program fd unavailable", name))?;
+        pipeline
+            .set(RULE_PIPELINE_V6_BASE + stage, fd, 0)
+            .with_context(|| format!("Failed to install {} in RULE_PIPELINE", name))?;
+    }
+
+    let post_v6 = ebpf
+        .program("post_rules_v6")
+        .context("post_rules_v6 program not found")?
+        .fd()
+        .context("post_rules_v6 program fd unavailable")?;
+    pipeline
+        .set(RULE_PIPELINE_V6_POST, post_v6, 0)
+        .context("Failed to install post_rules_v6 in RULE_PIPELINE")?;
+
+    for index in RULE_PIPELINE_V6_POST + 1..RULE_PIPELINE_SIZE {
+        let _ = pipeline.clear_index(&index);
+    }
+
     Ok(())
 }

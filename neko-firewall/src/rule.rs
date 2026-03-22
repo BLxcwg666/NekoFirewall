@@ -274,7 +274,10 @@ pub fn show_conntrack() -> Result<()> {
             if key.proto == 58 {
                 println!("  {} {} <-> {}", proto, src, dst);
             } else {
-                println!("  {} [{}]:{} -> [{}]:{}", proto, src, src_port, dst, dst_port);
+                println!(
+                    "  {} [{}]:{} -> [{}]:{}",
+                    proto, src, src_port, dst, dst_port
+                );
             }
             count += 1;
         }

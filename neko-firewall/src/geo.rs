@@ -31,11 +31,15 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
     let reader = maxminddb::Reader::from_source(COUNTRY_MMDB.to_vec())
         .context("Failed to load embedded Country mmdb")?;
 
-    let map4 = ebpf.take_map("GEO_COUNTRY_MAP").context("GEO_COUNTRY_MAP not found")?;
+    let map4 = ebpf
+        .take_map("GEO_COUNTRY_MAP")
+        .context("GEO_COUNTRY_MAP not found")?;
     let mut trie4: LpmTrie<_, u32, u32> =
         LpmTrie::try_from(map4).context("Failed to open GEO_COUNTRY_MAP")?;
 
-    let map6 = ebpf.take_map("GEO_COUNTRY_MAP6").context("GEO_COUNTRY_MAP6 not found")?;
+    let map6 = ebpf
+        .take_map("GEO_COUNTRY_MAP6")
+        .context("GEO_COUNTRY_MAP6 not found")?;
     let mut trie6: LpmTrie<_, [u8; 16], u32> =
         LpmTrie::try_from(map6).context("Failed to open GEO_COUNTRY_MAP6")?;
 
@@ -82,13 +86,11 @@ pub fn load_geo_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
     if fail4 > 0 || fail6 > 0 {
         log::warn!(
             "Country map insert failures: {} IPv4, {} IPv6 (map full?)",
-            fail4, fail6
+            fail4,
+            fail6
         );
     }
-    info!(
-        "Loaded {} IPv4 + {} IPv6 country prefixes",
-        count4, count6
-    );
+    info!("Loaded {} IPv4 + {} IPv6 country prefixes", count4, count6);
     Ok((count4, count6))
 }
 
@@ -96,11 +98,15 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
     let reader = maxminddb::Reader::from_source(ASN_MMDB.to_vec())
         .context("Failed to load embedded ASN mmdb")?;
 
-    let map4 = ebpf.take_map("GEO_ASN_MAP").context("GEO_ASN_MAP not found")?;
+    let map4 = ebpf
+        .take_map("GEO_ASN_MAP")
+        .context("GEO_ASN_MAP not found")?;
     let mut trie4: LpmTrie<_, u32, u32> =
         LpmTrie::try_from(map4).context("Failed to open GEO_ASN_MAP")?;
 
-    let map6 = ebpf.take_map("GEO_ASN_MAP6").context("GEO_ASN_MAP6 not found")?;
+    let map6 = ebpf
+        .take_map("GEO_ASN_MAP6")
+        .context("GEO_ASN_MAP6 not found")?;
     let mut trie6: LpmTrie<_, [u8; 16], u32> =
         LpmTrie::try_from(map6).context("Failed to open GEO_ASN_MAP6")?;
 
@@ -144,7 +150,8 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
     if fail4 > 0 || fail6 > 0 {
         log::warn!(
             "ASN map insert failures: {} IPv4, {} IPv6 (map full?)",
-            fail4, fail6
+            fail4,
+            fail6
         );
     }
     info!("Loaded {} IPv4 + {} IPv6 ASN prefixes", count4, count6);

@@ -1,19 +1,20 @@
 #![no_std]
 #![no_main]
 
+use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::bpf_ktime_get_ns,
     macros::{classifier, map, xdp},
-    maps::{Array, HashMap, LpmTrie, LruHashMap, PerfEventArray},
+    maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, PerfEventArray, ProgramArray},
     programs::{TcContext, XdpContext},
 };
-use aya_ebpf::maps::lpm_trie::Key;
 use core::mem;
 use neko_common::{
-    CompoundRule, ConnTrackKey, ConnTrackKey6, PacketLog,
-    ACTION_DROP, ACTION_PASS, MAX_COMPOUND_RULES,
-    MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
+    CompoundRule, ConnTrackKey, ConnTrackKey6, PacketCtxV4, PacketCtxV6, PacketLog, ACTION_DROP,
+    ACTION_PASS, FLAG_EMIT_EVENTS, MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
+    MAX_COMPOUND_RULES, RULES_PER_STAGE, RULE_PIPELINE_SIZE, RULE_PIPELINE_V4_BASE,
+    RULE_PIPELINE_V4_POST, RULE_PIPELINE_V6_BASE, RULE_PIPELINE_V6_POST, RULE_STAGE_COUNT,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -58,7 +59,22 @@ static EVENTS: PerfEventArray<PacketLog> = PerfEventArray::pinned(0);
 static GEO_POLICY: HashMap<u32, u32> = HashMap::pinned(512, 0);
 
 #[map]
-static RULES: Array<CompoundRule> = Array::pinned(MAX_COMPOUND_RULES, 0);
+static RUNTIME_FLAGS: HashMap<u32, u32> = HashMap::pinned(4, 0);
+
+#[map]
+static RULES_V4: Array<CompoundRule> = Array::pinned(MAX_COMPOUND_RULES, 0);
+
+#[map]
+static RULES_V6: Array<CompoundRule> = Array::pinned(MAX_COMPOUND_RULES, 0);
+
+#[map]
+static PACKET_CTX_V4: PerCpuArray<PacketCtxV4> = PerCpuArray::pinned(1, 0);
+
+#[map]
+static PACKET_CTX_V6: PerCpuArray<PacketCtxV6> = PerCpuArray::pinned(1, 0);
+
+#[map]
+static RULE_PIPELINE: ProgramArray = ProgramArray::pinned(RULE_PIPELINE_SIZE, 0);
 
 #[xdp]
 pub fn neko_firewall(ctx: XdpContext) -> u32 {
@@ -108,25 +124,33 @@ fn try_firewall_v4(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
     let transport_offset = EthHdr::LEN + ipv4_header_len(ipv4hdr)?;
     let proto_num = proto_to_num(proto);
 
-    // --- IP whitelist (LPM/CIDR) ---
     let ip_key = Key::new(32, src_addr);
     if ALLOWED_IPS.get(&ip_key).is_some() {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // --- Extract ports ---
     let (src_port, dst_port, ct_src_port, ct_dst_port) = match proto {
         IpProto::Tcp => {
             let tcphdr: *const TcpHdr = ptr_at(start, end, transport_offset)?;
             let raw_src = unsafe { (*tcphdr).source };
             let raw_dst = unsafe { (*tcphdr).dest };
-            (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
+            (
+                u16::from_be(raw_src),
+                u16::from_be(raw_dst),
+                raw_src,
+                raw_dst,
+            )
         }
         IpProto::Udp => {
             let udphdr: *const UdpHdr = ptr_at(start, end, transport_offset)?;
             let raw_src = unsafe { (*udphdr).source };
             let raw_dst = unsafe { (*udphdr).dest };
-            (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
+            (
+                u16::from_be(raw_src),
+                u16::from_be(raw_dst),
+                raw_src,
+                raw_dst,
+            )
         }
         IpProto::Icmp => {
             let icmp_type_ptr: *const u8 = ptr_at(start, end, transport_offset)?;
@@ -140,109 +164,22 @@ fn try_firewall_v4(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
     let country_id = GEO_COUNTRY_MAP.get(&geo_key).copied().unwrap_or(0);
     let asn_id = GEO_ASN_MAP.get(&geo_key).copied().unwrap_or(0);
 
-    for i in 0..MAX_COMPOUND_RULES {
-        if let Some(rule) = RULES.get(i) {
-            let mf = rule.match_fields;
-            if mf == 0 {
-                continue;
-            }
-            if rule.family == 6 {
-                continue;
-            }
-            let mut matched = true;
-            if mf & MATCH_PROTO != 0 && rule.proto != proto_num {
-                matched = false;
-            }
-            if mf & MATCH_PORT != 0 && rule.port != dst_port {
-                matched = false;
-            }
-            if mf & MATCH_COUNTRY != 0 && rule.country_id != country_id {
-                matched = false;
-            }
-            if mf & MATCH_ASN != 0 && rule.asn_id != asn_id {
-                matched = false;
-            }
-            if mf & MATCH_IP != 0 {
-                let pl = rule.prefix_len;
-                if pl > 0 && pl <= 32 {
-                    let mask = if pl >= 32 {
-                        !0u32
-                    } else {
-                        !0u32 << (32 - pl as u32)
-                    };
-                    let mask_be = mask.to_be();
-                    if (src_addr & mask_be) != (u32::from_ne_bytes([rule.src_ip[0], rule.src_ip[1], rule.src_ip[2], rule.src_ip[3]]) & mask_be) {
-                        matched = false;
-                    }
-                }
-            }
-            if matched {
-                if rule.action == ACTION_DROP {
-                    log_event_v4(ctx, src_addr, dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                    return Ok(xdp_action::XDP_DROP);
-                }
-                return Ok(xdp_action::XDP_PASS);
-            }
-        }
-    }
-
-    let mut geo_allowed = false;
-    if country_id != 0 {
-        if let Some(&action) = unsafe { GEO_POLICY.get(&country_id) } {
-            if action == ACTION_DROP {
-                log_event_v4(ctx, src_addr, dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                return Ok(xdp_action::XDP_DROP);
-            }
-            if action == ACTION_PASS {
-                geo_allowed = true;
-            }
-        }
-    }
-    if asn_id != 0 {
-        if let Some(&action) = unsafe { GEO_POLICY.get(&asn_id) } {
-            if action == ACTION_DROP {
-                log_event_v4(ctx, src_addr, dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                return Ok(xdp_action::XDP_DROP);
-            }
-            if action == ACTION_PASS {
-                geo_allowed = true;
-            }
-        }
-    }
-    if geo_allowed {
-        return Ok(xdp_action::XDP_PASS);
-    }
-
-    let proto_wildcard = (proto_num as u32) << 16;
-    if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
-        return Ok(xdp_action::XDP_PASS);
-    }
-    if dst_port > 0 {
-        let port_key = (proto_num as u32) << 16 | dst_port as u32;
-        if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
-            return Ok(xdp_action::XDP_PASS);
-        }
-    }
-
-    let ct_key = ConnTrackKey {
-        src_ip: src_addr,
-        dst_ip: dst_addr,
-        src_port: ct_src_port,
-        dst_port: ct_dst_port,
+    let packet = PacketCtxV4 {
+        src_addr,
+        dst_addr,
+        src_port,
+        dst_port,
+        ct_src_port,
+        ct_dst_port,
         proto: proto_num,
-        _pad: [0; 3],
+        _pad0: 0,
+        country_id,
+        asn_id,
     };
-    if let Some(&last_seen) = unsafe { CONNTRACK.get(&ct_key) } {
-        let now = unsafe { bpf_ktime_get_ns() };
-        if now.wrapping_sub(last_seen) < CONNTRACK_TIMEOUT_NS {
-            let _ = CONNTRACK.insert(&ct_key, &now, 0);
-            return Ok(xdp_action::XDP_PASS);
-        }
-        let _ = CONNTRACK.remove(&ct_key);
-    }
+    store_packet_ctx_v4(&packet)?;
 
-    log_event_v4(ctx, src_addr, dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-    Ok(xdp_action::XDP_DROP)
+    let _ = unsafe { RULE_PIPELINE.tail_call(ctx, RULE_PIPELINE_V4_BASE) };
+    Ok(post_rules_v4_action(&packet, ctx))
 }
 
 fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()> {
@@ -269,13 +206,23 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
             let tcphdr: *const TcpHdr = ptr_at(start, end, transport_offset)?;
             let raw_src = unsafe { (*tcphdr).source };
             let raw_dst = unsafe { (*tcphdr).dest };
-            (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
+            (
+                u16::from_be(raw_src),
+                u16::from_be(raw_dst),
+                raw_src,
+                raw_dst,
+            )
         }
         IpProto::Udp => {
             let udphdr: *const UdpHdr = ptr_at(start, end, transport_offset)?;
             let raw_src = unsafe { (*udphdr).source };
             let raw_dst = unsafe { (*udphdr).dest };
-            (u16::from_be(raw_src), u16::from_be(raw_dst), raw_src, raw_dst)
+            (
+                u16::from_be(raw_src),
+                u16::from_be(raw_dst),
+                raw_src,
+                raw_dst,
+            )
         }
         IpProto::Ipv6Icmp => {
             let icmp_type_ptr: *const u8 = ptr_at(start, end, transport_offset)?;
@@ -289,60 +236,370 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
     let country_id = GEO_COUNTRY_MAP6.get(&geo_key).copied().unwrap_or(0);
     let asn_id = GEO_ASN_MAP6.get(&geo_key).copied().unwrap_or(0);
 
-    for i in 0..MAX_COMPOUND_RULES {
-        if let Some(rule) = RULES.get(i) {
-            let mf = rule.match_fields;
-            if mf == 0 {
-                continue;
-            }
-            if rule.family == 4 {
-                continue;
-            }
-            let mut matched = true;
-            if mf & MATCH_PROTO != 0 && rule.proto != proto_num {
-                matched = false;
-            }
-            if mf & MATCH_PORT != 0 && rule.port != dst_port {
-                matched = false;
-            }
-            if mf & MATCH_COUNTRY != 0 && rule.country_id != country_id {
-                matched = false;
-            }
-            if mf & MATCH_ASN != 0 && rule.asn_id != asn_id {
-                matched = false;
-            }
-            if mf & MATCH_IP != 0 {
-                if !ipv6_prefix_match(&src_addr, &rule.src_ip, rule.prefix_len) {
-                    matched = false;
-                }
-            }
-            if matched {
-                if rule.action == ACTION_DROP {
-                    log_event_v6(ctx, &src_addr, &dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                    return Ok(xdp_action::XDP_DROP);
-                }
-                return Ok(xdp_action::XDP_PASS);
-            }
-        }
+    let packet = PacketCtxV6 {
+        src_addr,
+        dst_addr,
+        src_port,
+        dst_port,
+        ct_src_port,
+        ct_dst_port,
+        proto: proto_num,
+        _pad0: 0,
+        country_id,
+        asn_id,
+    };
+    store_packet_ctx_v6(&packet)?;
+
+    let _ = unsafe { RULE_PIPELINE.tail_call(ctx, RULE_PIPELINE_V6_BASE) };
+    Ok(post_rules_v6_action(&packet, ctx))
+}
+
+#[inline(always)]
+fn packet_ctx_v4_ptr() -> Result<*const PacketCtxV4, ()> {
+    PACKET_CTX_V4.get_ptr(0).ok_or(())
+}
+
+#[inline(always)]
+fn packet_ctx_v4_ptr_mut() -> Result<*mut PacketCtxV4, ()> {
+    PACKET_CTX_V4.get_ptr_mut(0).ok_or(())
+}
+
+#[inline(always)]
+fn packet_ctx_v6_ptr() -> Result<*const PacketCtxV6, ()> {
+    PACKET_CTX_V6.get_ptr(0).ok_or(())
+}
+
+#[inline(always)]
+fn packet_ctx_v6_ptr_mut() -> Result<*mut PacketCtxV6, ()> {
+    PACKET_CTX_V6.get_ptr_mut(0).ok_or(())
+}
+
+#[inline(always)]
+fn store_packet_ctx_v4(packet: &PacketCtxV4) -> Result<(), ()> {
+    unsafe {
+        *packet_ctx_v4_ptr_mut()? = *packet;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn store_packet_ctx_v6(packet: &PacketCtxV6) -> Result<(), ()> {
+    unsafe {
+        *packet_ctx_v6_ptr_mut()? = *packet;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+#[allow(unreachable_code)]
+fn tail_call_program(ctx: &XdpContext, index: u32) -> Result<u32, ()> {
+    unsafe { RULE_PIPELINE.tail_call(ctx, index) }.map_err(|_| ())?;
+    Ok(xdp_action::XDP_DROP)
+}
+
+#[inline(always)]
+fn rule_matches_v4(packet: &PacketCtxV4, rule: &CompoundRule) -> bool {
+    let mf = rule.match_fields;
+    if mf & MATCH_PROTO != 0 && rule.proto != packet.proto {
+        return false;
+    }
+    if mf & MATCH_PORT != 0 && rule.port != packet.dst_port {
+        return false;
+    }
+    if mf & MATCH_COUNTRY != 0 && rule.country_id != packet.country_id {
+        return false;
+    }
+    if mf & MATCH_ASN != 0 && rule.asn_id != packet.asn_id {
+        return false;
+    }
+    if mf & MATCH_IP != 0 && !ipv4_prefix_match(packet.src_addr, rule) {
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn rule_matches_v6(packet: &PacketCtxV6, rule: &CompoundRule) -> bool {
+    let mf = rule.match_fields;
+    if mf & MATCH_PROTO != 0 && rule.proto != packet.proto {
+        return false;
+    }
+    if mf & MATCH_PORT != 0 && rule.port != packet.dst_port {
+        return false;
+    }
+    if mf & MATCH_COUNTRY != 0 && rule.country_id != packet.country_id {
+        return false;
+    }
+    if mf & MATCH_ASN != 0 && rule.asn_id != packet.asn_id {
+        return false;
+    }
+    if mf & MATCH_IP != 0 && !ipv6_prefix_match(&packet.src_addr, &rule.src_ip, rule.prefix_len) {
+        return false;
+    }
+    true
+}
+
+#[inline(always)]
+fn ipv4_prefix_match(addr: u32, rule: &CompoundRule) -> bool {
+    let pl = rule.prefix_len;
+    if pl == 0 {
+        return true;
+    }
+    if pl > 32 {
+        return false;
     }
 
+    let mask = if pl >= 32 {
+        !0u32
+    } else {
+        !0u32 << (32 - pl as u32)
+    };
+    let mask_be = mask.to_be();
+    let rule_addr = u32::from_ne_bytes([
+        rule.src_ip[0],
+        rule.src_ip[1],
+        rule.src_ip[2],
+        rule.src_ip[3],
+    ]);
+    (addr & mask_be) == (rule_addr & mask_be)
+}
+
+#[inline(always)]
+fn ipv6_prefix_match(addr: &[u8; 16], rule_addr: &[u8; 16], prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    let pl = prefix_len as u32;
+
+    let a0 = u32::from_be_bytes([addr[0], addr[1], addr[2], addr[3]]);
+    let r0 = u32::from_be_bytes([rule_addr[0], rule_addr[1], rule_addr[2], rule_addr[3]]);
+    if pl >= 32 {
+        if a0 != r0 {
+            return false;
+        }
+    } else {
+        let mask = !0u32 << (32 - pl);
+        return (a0 & mask) == (r0 & mask);
+    }
+
+    let a1 = u32::from_be_bytes([addr[4], addr[5], addr[6], addr[7]]);
+    let r1 = u32::from_be_bytes([rule_addr[4], rule_addr[5], rule_addr[6], rule_addr[7]]);
+    if pl >= 64 {
+        if a1 != r1 {
+            return false;
+        }
+    } else {
+        let mask = !0u32 << (64 - pl);
+        return (a1 & mask) == (r1 & mask);
+    }
+
+    let a2 = u32::from_be_bytes([addr[8], addr[9], addr[10], addr[11]]);
+    let r2 = u32::from_be_bytes([rule_addr[8], rule_addr[9], rule_addr[10], rule_addr[11]]);
+    if pl >= 96 {
+        if a2 != r2 {
+            return false;
+        }
+    } else {
+        let mask = !0u32 << (96 - pl);
+        return (a2 & mask) == (r2 & mask);
+    }
+
+    let a3 = u32::from_be_bytes([addr[12], addr[13], addr[14], addr[15]]);
+    let r3 = u32::from_be_bytes([rule_addr[12], rule_addr[13], rule_addr[14], rule_addr[15]]);
+    if pl >= 128 {
+        return a3 == r3;
+    }
+    let mask = !0u32 << (128 - pl);
+    (a3 & mask) == (r3 & mask)
+}
+
+#[inline(always)]
+fn apply_rule_v4(packet: &PacketCtxV4, ctx: &XdpContext, action: u32) -> u32 {
+    if action == ACTION_DROP {
+        log_event_v4(
+            ctx,
+            packet.src_addr,
+            packet.dst_addr,
+            packet.src_port,
+            packet.dst_port,
+            packet.proto,
+            ACTION_DROP as u8,
+        );
+        xdp_action::XDP_DROP
+    } else {
+        xdp_action::XDP_PASS
+    }
+}
+
+#[inline(always)]
+fn apply_rule_v6(packet: &PacketCtxV6, ctx: &XdpContext, action: u32) -> u32 {
+    if action == ACTION_DROP {
+        log_event_v6(
+            ctx,
+            &packet.src_addr,
+            &packet.dst_addr,
+            packet.src_port,
+            packet.dst_port,
+            packet.proto,
+            ACTION_DROP as u8,
+        );
+        xdp_action::XDP_DROP
+    } else {
+        xdp_action::XDP_PASS
+    }
+}
+
+#[inline(always)]
+fn compound_stage_v4(ctx: &XdpContext, stage: u32) -> Result<u32, ()> {
+    let packet = unsafe { &*packet_ctx_v4_ptr()? };
+    let mut offset = 0;
+    while offset < RULES_PER_STAGE {
+        let index = stage * RULES_PER_STAGE + offset;
+        if index >= MAX_COMPOUND_RULES {
+            return tail_call_program(ctx, RULE_PIPELINE_V4_POST);
+        }
+        let Some(rule) = RULES_V4.get(index) else {
+            return tail_call_program(ctx, RULE_PIPELINE_V4_POST);
+        };
+        if rule.match_fields == 0 {
+            return tail_call_program(ctx, RULE_PIPELINE_V4_POST);
+        }
+        if rule_matches_v4(packet, rule) {
+            return Ok(apply_rule_v4(packet, ctx, rule.action));
+        }
+        offset += 1;
+    }
+
+    let next = if stage + 1 < RULE_STAGE_COUNT {
+        RULE_PIPELINE_V4_BASE + stage + 1
+    } else {
+        RULE_PIPELINE_V4_POST
+    };
+    tail_call_program(ctx, next)
+}
+
+#[inline(always)]
+fn compound_stage_v6(ctx: &XdpContext, stage: u32) -> Result<u32, ()> {
+    let packet = unsafe { &*packet_ctx_v6_ptr()? };
+    let mut offset = 0;
+    while offset < RULES_PER_STAGE {
+        let index = stage * RULES_PER_STAGE + offset;
+        if index >= MAX_COMPOUND_RULES {
+            return tail_call_program(ctx, RULE_PIPELINE_V6_POST);
+        }
+        let Some(rule) = RULES_V6.get(index) else {
+            return tail_call_program(ctx, RULE_PIPELINE_V6_POST);
+        };
+        if rule.match_fields == 0 {
+            return tail_call_program(ctx, RULE_PIPELINE_V6_POST);
+        }
+        if rule_matches_v6(packet, rule) {
+            return Ok(apply_rule_v6(packet, ctx, rule.action));
+        }
+        offset += 1;
+    }
+
+    let next = if stage + 1 < RULE_STAGE_COUNT {
+        RULE_PIPELINE_V6_BASE + stage + 1
+    } else {
+        RULE_PIPELINE_V6_POST
+    };
+    tail_call_program(ctx, next)
+}
+
+macro_rules! define_v4_stage {
+    ($name:ident, $stage:expr) => {
+        #[xdp]
+        pub fn $name(ctx: XdpContext) -> u32 {
+            match compound_stage_v4(&ctx, $stage) {
+                Ok(action) => action,
+                Err(_) => xdp_action::XDP_DROP,
+            }
+        }
+    };
+}
+
+macro_rules! define_v6_stage {
+    ($name:ident, $stage:expr) => {
+        #[xdp]
+        pub fn $name(ctx: XdpContext) -> u32 {
+            match compound_stage_v6(&ctx, $stage) {
+                Ok(action) => action,
+                Err(_) => xdp_action::XDP_DROP,
+            }
+        }
+    };
+}
+
+define_v4_stage!(compound_v4_stage_0, 0);
+define_v4_stage!(compound_v4_stage_1, 1);
+define_v4_stage!(compound_v4_stage_2, 2);
+define_v4_stage!(compound_v4_stage_3, 3);
+define_v4_stage!(compound_v4_stage_4, 4);
+define_v4_stage!(compound_v4_stage_5, 5);
+define_v4_stage!(compound_v4_stage_6, 6);
+define_v4_stage!(compound_v4_stage_7, 7);
+
+define_v6_stage!(compound_v6_stage_0, 0);
+define_v6_stage!(compound_v6_stage_1, 1);
+define_v6_stage!(compound_v6_stage_2, 2);
+define_v6_stage!(compound_v6_stage_3, 3);
+define_v6_stage!(compound_v6_stage_4, 4);
+define_v6_stage!(compound_v6_stage_5, 5);
+define_v6_stage!(compound_v6_stage_6, 6);
+define_v6_stage!(compound_v6_stage_7, 7);
+
+#[xdp]
+pub fn post_rules_v4(ctx: XdpContext) -> u32 {
+    match packet_ctx_v4_ptr() {
+        Ok(ptr) => post_rules_v4_action(unsafe { &*ptr }, &ctx),
+        Err(_) => xdp_action::XDP_DROP,
+    }
+}
+
+#[xdp]
+pub fn post_rules_v6(ctx: XdpContext) -> u32 {
+    match packet_ctx_v6_ptr() {
+        Ok(ptr) => post_rules_v6_action(unsafe { &*ptr }, &ctx),
+        Err(_) => xdp_action::XDP_DROP,
+    }
+}
+
+#[inline(always)]
+fn post_rules_v4_action(packet: &PacketCtxV4, ctx: &XdpContext) -> u32 {
     let mut geo_allowed = false;
-    if country_id != 0 {
-        if let Some(&action) = unsafe { GEO_POLICY.get(&country_id) } {
+    if packet.country_id != 0 {
+        if let Some(&action) = unsafe { GEO_POLICY.get(&packet.country_id) } {
             if action == ACTION_DROP {
-                log_event_v6(ctx, &src_addr, &dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                return Ok(xdp_action::XDP_DROP);
+                log_event_v4(
+                    ctx,
+                    packet.src_addr,
+                    packet.dst_addr,
+                    packet.src_port,
+                    packet.dst_port,
+                    packet.proto,
+                    ACTION_DROP as u8,
+                );
+                return xdp_action::XDP_DROP;
             }
             if action == ACTION_PASS {
                 geo_allowed = true;
             }
         }
     }
-    if asn_id != 0 {
-        if let Some(&action) = unsafe { GEO_POLICY.get(&asn_id) } {
+    if packet.asn_id != 0 {
+        if let Some(&action) = unsafe { GEO_POLICY.get(&packet.asn_id) } {
             if action == ACTION_DROP {
-                log_event_v6(ctx, &src_addr, &dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-                return Ok(xdp_action::XDP_DROP);
+                log_event_v4(
+                    ctx,
+                    packet.src_addr,
+                    packet.dst_addr,
+                    packet.src_port,
+                    packet.dst_port,
+                    packet.proto,
+                    ACTION_DROP as u8,
+                );
+                return xdp_action::XDP_DROP;
             }
             if action == ACTION_PASS {
                 geo_allowed = true;
@@ -350,39 +607,132 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
         }
     }
     if geo_allowed {
-        return Ok(xdp_action::XDP_PASS);
+        return xdp_action::XDP_PASS;
     }
 
-    let proto_wildcard = (proto_num as u32) << 16;
+    let proto_wildcard = (packet.proto as u32) << 16;
     if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
-        return Ok(xdp_action::XDP_PASS);
+        return xdp_action::XDP_PASS;
     }
-    if dst_port > 0 {
-        let port_key = (proto_num as u32) << 16 | dst_port as u32;
+    if packet.dst_port > 0 {
+        let port_key = (packet.proto as u32) << 16 | packet.dst_port as u32;
         if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
-            return Ok(xdp_action::XDP_PASS);
+            return xdp_action::XDP_PASS;
+        }
+    }
+
+    let ct_key = ConnTrackKey {
+        src_ip: packet.src_addr,
+        dst_ip: packet.dst_addr,
+        src_port: packet.ct_src_port,
+        dst_port: packet.ct_dst_port,
+        proto: packet.proto,
+        _pad: [0; 3],
+    };
+    if let Some(&last_seen) = unsafe { CONNTRACK.get(&ct_key) } {
+        let now = unsafe { bpf_ktime_get_ns() };
+        if now.wrapping_sub(last_seen) < CONNTRACK_TIMEOUT_NS {
+            let _ = CONNTRACK.insert(&ct_key, &now, 0);
+            return xdp_action::XDP_PASS;
+        }
+        let _ = CONNTRACK.remove(&ct_key);
+    }
+
+    log_event_v4(
+        ctx,
+        packet.src_addr,
+        packet.dst_addr,
+        packet.src_port,
+        packet.dst_port,
+        packet.proto,
+        ACTION_DROP as u8,
+    );
+    xdp_action::XDP_DROP
+}
+
+#[inline(always)]
+fn post_rules_v6_action(packet: &PacketCtxV6, ctx: &XdpContext) -> u32 {
+    let mut geo_allowed = false;
+    if packet.country_id != 0 {
+        if let Some(&action) = unsafe { GEO_POLICY.get(&packet.country_id) } {
+            if action == ACTION_DROP {
+                log_event_v6(
+                    ctx,
+                    &packet.src_addr,
+                    &packet.dst_addr,
+                    packet.src_port,
+                    packet.dst_port,
+                    packet.proto,
+                    ACTION_DROP as u8,
+                );
+                return xdp_action::XDP_DROP;
+            }
+            if action == ACTION_PASS {
+                geo_allowed = true;
+            }
+        }
+    }
+    if packet.asn_id != 0 {
+        if let Some(&action) = unsafe { GEO_POLICY.get(&packet.asn_id) } {
+            if action == ACTION_DROP {
+                log_event_v6(
+                    ctx,
+                    &packet.src_addr,
+                    &packet.dst_addr,
+                    packet.src_port,
+                    packet.dst_port,
+                    packet.proto,
+                    ACTION_DROP as u8,
+                );
+                return xdp_action::XDP_DROP;
+            }
+            if action == ACTION_PASS {
+                geo_allowed = true;
+            }
+        }
+    }
+    if geo_allowed {
+        return xdp_action::XDP_PASS;
+    }
+
+    let proto_wildcard = (packet.proto as u32) << 16;
+    if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
+        return xdp_action::XDP_PASS;
+    }
+    if packet.dst_port > 0 {
+        let port_key = (packet.proto as u32) << 16 | packet.dst_port as u32;
+        if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
+            return xdp_action::XDP_PASS;
         }
     }
 
     let ct_key = ConnTrackKey6 {
-        src_ip: src_addr,
-        dst_ip: dst_addr,
-        src_port: ct_src_port,
-        dst_port: ct_dst_port,
-        proto: proto_num,
+        src_ip: packet.src_addr,
+        dst_ip: packet.dst_addr,
+        src_port: packet.ct_src_port,
+        dst_port: packet.ct_dst_port,
+        proto: packet.proto,
         _pad: [0; 3],
     };
     if let Some(&last_seen) = unsafe { CONNTRACK6.get(&ct_key) } {
         let now = unsafe { bpf_ktime_get_ns() };
         if now.wrapping_sub(last_seen) < CONNTRACK_TIMEOUT_NS {
             let _ = CONNTRACK6.insert(&ct_key, &now, 0);
-            return Ok(xdp_action::XDP_PASS);
+            return xdp_action::XDP_PASS;
         }
         let _ = CONNTRACK6.remove(&ct_key);
     }
 
-    log_event_v6(ctx, &src_addr, &dst_addr, src_port, dst_port, proto_num, ACTION_DROP as u8);
-    Ok(xdp_action::XDP_DROP)
+    log_event_v6(
+        ctx,
+        &packet.src_addr,
+        &packet.dst_addr,
+        packet.src_port,
+        packet.dst_port,
+        packet.proto,
+        ACTION_DROP as u8,
+    );
+    xdp_action::XDP_DROP
 }
 
 #[classifier]
@@ -494,46 +844,13 @@ fn proto_to_num(proto: IpProto) -> u8 {
 }
 
 #[inline(always)]
-fn ipv6_prefix_match(addr: &[u8; 16], rule_addr: &[u8; 16], prefix_len: u8) -> bool {
-    if prefix_len == 0 {
-        return true;
-    }
-    let pl = prefix_len as u32;
-
-    let a0 = u32::from_be_bytes([addr[0], addr[1], addr[2], addr[3]]);
-    let r0 = u32::from_be_bytes([rule_addr[0], rule_addr[1], rule_addr[2], rule_addr[3]]);
-    if pl >= 32 {
-        if a0 != r0 { return false; }
+fn runtime_flag_enabled(flag: u32) -> bool {
+    let key = 0u32;
+    if let Some(&flags) = unsafe { RUNTIME_FLAGS.get(&key) } {
+        flags & flag != 0
     } else {
-        let mask = !0u32 << (32 - pl);
-        return (a0 & mask) == (r0 & mask);
+        false
     }
-
-    let a1 = u32::from_be_bytes([addr[4], addr[5], addr[6], addr[7]]);
-    let r1 = u32::from_be_bytes([rule_addr[4], rule_addr[5], rule_addr[6], rule_addr[7]]);
-    if pl >= 64 {
-        if a1 != r1 { return false; }
-    } else {
-        let mask = !0u32 << (64 - pl);
-        return (a1 & mask) == (r1 & mask);
-    }
-
-    let a2 = u32::from_be_bytes([addr[8], addr[9], addr[10], addr[11]]);
-    let r2 = u32::from_be_bytes([rule_addr[8], rule_addr[9], rule_addr[10], rule_addr[11]]);
-    if pl >= 96 {
-        if a2 != r2 { return false; }
-    } else {
-        let mask = !0u32 << (96 - pl);
-        return (a2 & mask) == (r2 & mask);
-    }
-
-    let a3 = u32::from_be_bytes([addr[12], addr[13], addr[14], addr[15]]);
-    let r3 = u32::from_be_bytes([rule_addr[12], rule_addr[13], rule_addr[14], rule_addr[15]]);
-    if pl >= 128 {
-        return a3 == r3;
-    }
-    let mask = !0u32 << (128 - pl);
-    (a3 & mask) == (r3 & mask)
 }
 
 #[inline(always)]
@@ -546,12 +863,21 @@ fn log_event_v4(
     protocol: u8,
     action: u8,
 ) {
+    if !runtime_flag_enabled(FLAG_EMIT_EVENTS) {
+        return;
+    }
     let mut src = [0u8; 16];
     let mut dst = [0u8; 16];
     let src_bytes = src_addr.to_ne_bytes();
     let dst_bytes = dst_addr.to_ne_bytes();
-    src[0] = src_bytes[0]; src[1] = src_bytes[1]; src[2] = src_bytes[2]; src[3] = src_bytes[3];
-    dst[0] = dst_bytes[0]; dst[1] = dst_bytes[1]; dst[2] = dst_bytes[2]; dst[3] = dst_bytes[3];
+    src[0] = src_bytes[0];
+    src[1] = src_bytes[1];
+    src[2] = src_bytes[2];
+    src[3] = src_bytes[3];
+    dst[0] = dst_bytes[0];
+    dst[1] = dst_bytes[1];
+    dst[2] = dst_bytes[2];
+    dst[3] = dst_bytes[3];
 
     let log = PacketLog {
         src_addr: src,
@@ -576,6 +902,9 @@ fn log_event_v6(
     protocol: u8,
     action: u8,
 ) {
+    if !runtime_flag_enabled(FLAG_EMIT_EVENTS) {
+        return;
+    }
     let log = PacketLog {
         src_addr: *src_addr,
         dst_addr: *dst_addr,
