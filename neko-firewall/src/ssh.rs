@@ -22,7 +22,11 @@ pub fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
     let mut missing_ports = Vec::new();
     for ssh_port in ssh_ports.iter().copied() {
         let ssh_key = port_key(6, ssh_port);
-        if map.get(&ssh_key, 0).is_ok() || allowed_by_compound_rules(ssh_port) {
+        let any_proto_key = port_key(0, ssh_port);
+        if map.get(&ssh_key, 0).is_ok()
+            || map.get(&any_proto_key, 0).is_ok()
+            || allowed_by_compound_rules(ssh_port)
+        {
             continue;
         }
         if !missing_ports.contains(&ssh_port) {

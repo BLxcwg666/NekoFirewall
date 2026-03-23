@@ -91,7 +91,7 @@ pub fn block_ip(cidr: &str) -> Result<()> {
 }
 
 pub fn allow_port(proto: &str, port: u16) -> Result<()> {
-    let proto_num = parse_proto(proto)?;
+    let proto_num = parse_port_proto(proto)?;
     let key = port_key(proto_num, port);
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.insert(key, ACTION_PASS, 0)?;
@@ -109,7 +109,7 @@ pub fn allow_port(proto: &str, port: u16) -> Result<()> {
 }
 
 pub fn block_port(proto: &str, port: u16) -> Result<()> {
-    let proto_num = parse_proto(proto)?;
+    let proto_num = parse_port_proto(proto)?;
     let key = port_key(proto_num, port);
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.remove(&key)?;
@@ -198,13 +198,14 @@ pub fn list_rules() -> Result<()> {
             let (key, _) = res.context("Failed to read entry")?;
             let pnum = (key >> 16) as u8;
             let port = (key & 0xFFFF) as u16;
-            let name = proto_name(pnum);
             if port == 0 {
-                println!("  ALLOW proto {}", name);
+                println!("  ALLOW proto {}", proto_name(pnum));
+            } else if pnum == 0 {
+                println!("  ALLOW {}/any", port);
             } else if pnum == 1 || pnum == 58 {
-                println!("  ALLOW {} type {}", name, port);
+                println!("  ALLOW {} type {}", proto_name(pnum), port);
             } else {
-                println!("  ALLOW {}/{}", port, name);
+                println!("  ALLOW {}/{}", port, proto_name(pnum));
             }
             count += 1;
         }
@@ -290,4 +291,37 @@ pub fn parse_proto(proto: &str) -> Result<u8> {
             proto
         )
     })
+}
+
+pub(crate) fn parse_port_proto(proto: &str) -> Result<u8> {
+    if proto.eq_ignore_ascii_case("any") {
+        Ok(0)
+    } else {
+        parse_proto(proto)
+    }
+}
+
+pub(crate) fn proto_uses_type(proto: &str) -> bool {
+    proto.eq_ignore_ascii_case("icmp")
+        || proto.eq_ignore_ascii_case("icmpv6")
+        || proto.eq_ignore_ascii_case("ipv6-icmp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_port_proto, proto_uses_type};
+
+    #[test]
+    fn port_rules_accept_any_protocol() {
+        assert_eq!(parse_port_proto("any").unwrap(), 0);
+    }
+
+    #[test]
+    fn icmp_protocols_use_type_labels() {
+        assert!(proto_uses_type("icmp"));
+        assert!(proto_uses_type("icmpv6"));
+        assert!(proto_uses_type("ipv6-icmp"));
+        assert!(!proto_uses_type("any"));
+        assert!(!proto_uses_type("tcp"));
+    }
 }

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use aya::maps::{lpm_trie::Key, Array, HashMap};
 use neko_common::{
-    port_key, CompoundRule, ASN_FLAG, ACTION_DROP, ACTION_PASS, MATCH_ASN, MATCH_COUNTRY,
-    MATCH_IP, MATCH_PORT, MATCH_PROTO, MAX_COMPOUND_RULES,
+    port_key, CompoundRule, ACTION_DROP, ACTION_PASS, ASN_FLAG, MATCH_ASN, MATCH_COUNTRY, MATCH_IP,
+    MATCH_PORT, MATCH_PROTO, MAX_COMPOUND_RULES,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -108,7 +108,7 @@ impl Config {
             let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
             for port_str in &self.allow.ports {
                 if let Some((proto, port)) = parse_port_entry(port_str) {
-                    if let Some(num) = neko_common::parse_proto(proto) {
+                    if let Ok(num) = rule::parse_port_proto(proto) {
                         let key = port_key(num, port);
                         map.insert(key, ACTION_PASS, 0)?;
                     } else {

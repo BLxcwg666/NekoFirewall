@@ -218,11 +218,11 @@ async fn main() -> Result<()> {
             }
             RuleTarget::Port { proto, port } => {
                 rule::allow_port(&proto, port)?;
-                let pnum = rule::parse_proto(&proto)?;
-                if pnum == 1 || pnum == 58 {
-                    println!("Whitelisted: {} type {}", proto, port);
+                let display_proto = proto.to_lowercase();
+                if rule::proto_uses_type(&display_proto) {
+                    println!("Whitelisted: {} type {}", display_proto, port);
                 } else {
-                    println!("Whitelisted: {}/{}", port, proto);
+                    println!("Whitelisted: {}/{}", port, display_proto);
                 }
             }
             RuleTarget::Proto { proto } => {

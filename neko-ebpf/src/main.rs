@@ -11,11 +11,10 @@ use aya_ebpf::{
 };
 use core::mem;
 use neko_common::{
-    CompoundRule, ConnTrackKey, ConnTrackKey6, PacketCtxV4, PacketCtxV6, PacketLog, ACTION_DROP,
-    ACTION_PASS, FLAG_EMIT_EVENTS, MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
-    MAX_COMPOUND_RULES, RULES_PER_STAGE, RULE_PIPELINE_SIZE, RULE_PIPELINE_V4_BASE,
+    port_key, CompoundRule, ConnTrackKey, ConnTrackKey6, PacketCtxV4, PacketCtxV6, PacketLog,
+    ACTION_DROP, ACTION_PASS, FLAG_EMIT_EVENTS, MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT,
+    MATCH_PROTO, MAX_COMPOUND_RULES, RULES_PER_STAGE, RULE_PIPELINE_SIZE, RULE_PIPELINE_V4_BASE,
     RULE_PIPELINE_V4_POST, RULE_PIPELINE_V6_BASE, RULE_PIPELINE_V6_POST, RULE_STAGE_COUNT,
-    port_key,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -625,6 +624,10 @@ fn post_rules_v4_action(packet: &PacketCtxV4, ctx: &XdpContext) -> u32 {
         if unsafe { ALLOWED_PORTS.get(&pk) }.is_some() {
             return xdp_action::XDP_PASS;
         }
+        let any_proto_pk = port_key(0, packet.dst_port);
+        if unsafe { ALLOWED_PORTS.get(&any_proto_pk) }.is_some() {
+            return xdp_action::XDP_PASS;
+        }
     }
 
     let ct_key = ConnTrackKey {
@@ -708,6 +711,10 @@ fn post_rules_v6_action(packet: &PacketCtxV6, ctx: &XdpContext) -> u32 {
     if packet.dst_port > 0 {
         let pk = port_key(packet.proto, packet.dst_port);
         if unsafe { ALLOWED_PORTS.get(&pk) }.is_some() {
+            return xdp_action::XDP_PASS;
+        }
+        let any_proto_pk = port_key(0, packet.dst_port);
+        if unsafe { ALLOWED_PORTS.get(&any_proto_pk) }.is_some() {
             return xdp_action::XDP_PASS;
         }
     }
