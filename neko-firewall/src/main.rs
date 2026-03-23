@@ -3,15 +3,15 @@ mod config;
 mod geo;
 mod loader;
 mod rule;
+mod ssh;
 
 use anyhow::Result;
 use aya::maps::perf::AsyncPerfEventArray;
 use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use log::info;
-use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::process::Command;
+use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS, FLAG_EMIT_EVENTS};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::signal;
 
 fn set_title(title: &str) {
@@ -34,11 +34,11 @@ enum Commands {
     },
     Allow {
         #[command(subcommand)]
-        target: AllowTarget,
+        target: RuleTarget,
     },
     Block {
         #[command(subcommand)]
-        target: BlockTarget,
+        target: RuleTarget,
     },
     List,
     Conntrack,
@@ -54,16 +54,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum AllowTarget {
-    Ip { addr: String },
-    Port { proto: String, port: u16 },
-    Proto { proto: String },
-    Country { code: String },
-    Asn { asn: u32 },
-}
-
-#[derive(Subcommand)]
-enum BlockTarget {
+enum RuleTarget {
     Ip { addr: String },
     Port { proto: String, port: u16 },
     Proto { proto: String },
@@ -92,10 +83,7 @@ enum RuleAction {
     List,
 }
 
-fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
-    let events_map = ebpf.take_map("EVENTS").expect("EVENTS map not found");
-    let mut perf_array = AsyncPerfEventArray::try_from(events_map)?;
-
+fn spawn_perf_readers(perf_array: &mut AsyncPerfEventArray<aya::maps::MapData>) -> Result<()> {
     let cpus = aya::util::online_cpus().unwrap();
     for cpu_id in cpus {
         let mut buf = perf_array.open(cpu_id, None)?;
@@ -104,11 +92,18 @@ fn spawn_event_readers(ebpf: &mut aya::Ebpf) -> Result<()> {
                 .map(|_| BytesMut::with_capacity(std::mem::size_of::<PacketLog>()))
                 .collect::<Vec<_>>();
             loop {
-                let events = buf.read_events(&mut buffers).await.unwrap();
-                for i in 0..events.read {
-                    let ptr = buffers[i].as_ptr() as *const PacketLog;
-                    let log = unsafe { ptr.read_unaligned() };
-                    print_packet_log(&log);
+                match buf.read_events(&mut buffers).await {
+                    Ok(events) => {
+                        for i in 0..events.read {
+                            let ptr = buffers[i].as_ptr() as *const PacketLog;
+                            let log = unsafe { ptr.read_unaligned() };
+                            print_packet_log(&log);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("perf event read error: {}", e);
+                        continue;
+                    }
                 }
             }
         });
@@ -124,7 +119,6 @@ fn print_packet_log(log: &PacketLog) {
     };
 
     if log.family == 6 {
-        // IPv6
         let src = Ipv6Addr::from(log.src_addr);
         let dst = Ipv6Addr::from(log.dst_addr);
         match log.protocol {
@@ -143,21 +137,18 @@ fn print_packet_log(log: &PacketLog) {
             p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
         }
     } else {
-        // IPv4 — address stored in first 4 bytes
-        let src_bytes = [
+        let src = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes([
             log.src_addr[0],
             log.src_addr[1],
             log.src_addr[2],
             log.src_addr[3],
-        ];
-        let src = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(src_bytes)));
-        let dst_bytes = [
+        ])));
+        let dst = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes([
             log.dst_addr[0],
             log.dst_addr[1],
             log.dst_addr[2],
             log.dst_addr[3],
-        ];
-        let dst = Ipv4Addr::from(u32::from_be(u32::from_ne_bytes(dst_bytes)));
+        ])));
         match log.protocol {
             1 => println!(
                 "[{}] ICMP {} -> {} (type {})",
@@ -173,222 +164,6 @@ fn print_packet_log(log: &PacketLog) {
             ),
             p => println!("[{}] proto={} {} -> {}", action, p, src, dst),
         }
-    }
-}
-
-fn detect_ssh_ports() -> Vec<u16> {
-    if let Some(port) = ssh_port_from_connection_env() {
-        return vec![port];
-    }
-
-    if let Some(ports) = ssh_ports_from_sshd() {
-        return ports;
-    }
-
-    if let Some(ports) = ssh_ports_from_config() {
-        return ports;
-    }
-
-    vec![22]
-}
-
-fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
-    let ssh_ports = detect_ssh_ports();
-
-    let map = ebpf
-        .map("ALLOWED_PORTS")
-        .expect("ALLOWED_PORTS map not found");
-    let map: aya::maps::HashMap<_, u32, u32> =
-        aya::maps::HashMap::try_from(map).expect("ALLOWED_PORTS type mismatch");
-
-    let tcp_wildcard = 6u32 << 16;
-    if map.get(&tcp_wildcard, 0).is_ok() {
-        return;
-    }
-
-    let mut missing_ports = Vec::new();
-    for ssh_port in ssh_ports.iter().copied() {
-        let ssh_key = (6u32 << 16) | ssh_port as u32;
-        if map.get(&ssh_key, 0).is_ok() || ssh_allowed_by_compound_rules(ssh_port) {
-            continue;
-        }
-        if !missing_ports.contains(&ssh_port) {
-            missing_ports.push(ssh_port);
-        }
-    }
-
-    if missing_ports.is_empty() {
-        return;
-    }
-
-    missing_ports.sort_unstable();
-    let missing_list = missing_ports
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    eprintln!(
-        "!  WARNING: SSH port(s) {}/tcp are NOT in allowed rules",
-        missing_list
-    );
-    eprintln!("!  You may lose SSH access after firewall attaches");
-    if missing_ports.len() == 1 {
-        eprintln!("!  Run: nf allow port tcp {}", missing_ports[0]);
-    }
-    eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-}
-
-fn ssh_port_from_connection_env() -> Option<u16> {
-    std::env::var("SSH_CONNECTION").ok().and_then(|conn| {
-        conn.split_whitespace()
-            .nth(3)
-            .and_then(|p| p.parse::<u16>().ok())
-    })
-}
-
-fn ssh_ports_from_sshd() -> Option<Vec<u16>> {
-    for program in ["/usr/sbin/sshd", "/usr/bin/sshd", "sshd"] {
-        let Ok(output) = Command::new(program).arg("-T").output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-
-        let ports = parse_sshd_ports(&String::from_utf8_lossy(&output.stdout));
-        if !ports.is_empty() {
-            return Some(ports);
-        }
-    }
-    None
-}
-
-fn ssh_ports_from_config() -> Option<Vec<u16>> {
-    let content = std::fs::read_to_string("/etc/ssh/sshd_config").ok()?;
-    let ports = parse_sshd_ports(&content);
-    if ports.is_empty() {
-        None
-    } else {
-        Some(ports)
-    }
-}
-
-fn parse_sshd_ports(content: &str) -> Vec<u16> {
-    let mut ports = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        if !matches!(parts.next(), Some(keyword) if keyword.eq_ignore_ascii_case("port")) {
-            continue;
-        }
-        if let Some(value) = parts.next() {
-            if let Ok(port) = value.parse::<u16>() {
-                ports.push(port);
-            }
-        }
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
-}
-
-fn ssh_allowed_by_compound_rules(ssh_port: u16) -> bool {
-    let Ok(cfg) = config::Config::load() else {
-        return false;
-    };
-    let ssh_family = detect_ssh_family();
-    cfg.rules
-        .iter()
-        .any(|rule| compound_rule_allows_ssh(rule, ssh_port, ssh_family))
-}
-
-fn detect_ssh_family() -> Option<u8> {
-    let server_ip = std::env::var("SSH_CONNECTION")
-        .ok()
-        .and_then(|conn| conn.split_whitespace().nth(2).map(str::to_owned))?;
-    let ip: IpAddr = server_ip.parse().ok()?;
-    Some(match ip {
-        IpAddr::V4(_) => 4,
-        IpAddr::V6(_) => 6,
-    })
-}
-
-fn compound_rule_allows_ssh(
-    rule_entry: &config::CompoundRuleEntry,
-    ssh_port: u16,
-    ssh_family: Option<u8>,
-) -> bool {
-    if !rule_entry.action.eq_ignore_ascii_case("allow") {
-        return false;
-    }
-
-    let has_specific_proto = rule_entry
-        .proto
-        .as_deref()
-        .is_some_and(|proto| !proto.eq_ignore_ascii_case("any"));
-
-    if !has_specific_proto && rule_entry.port.is_none() {
-        return false;
-    }
-
-    if let Some(proto) = &rule_entry.proto {
-        if !proto.eq_ignore_ascii_case("tcp") && !proto.eq_ignore_ascii_case("any") {
-            return false;
-        }
-    }
-
-    if let Some(port) = rule_entry.port {
-        if port != ssh_port {
-            return false;
-        }
-    }
-
-    let Some(ssh_family) = ssh_family else {
-        return true;
-    };
-
-    let Some(ip) = rule_entry.ip.as_deref() else {
-        return true;
-    };
-
-    match rule::parse_cidr(ip) {
-        Ok(rule::CidrAddr::V4(_, _)) => ssh_family == 4,
-        Ok(rule::CidrAddr::V6(_, _)) => ssh_family == 6,
-        Err(_) => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compound_rule_allows_ssh;
-    use crate::config::CompoundRuleEntry;
-
-    fn allow_rule(proto: Option<&str>, port: Option<u16>) -> CompoundRuleEntry {
-        CompoundRuleEntry {
-            action: "allow".into(),
-            proto: proto.map(str::to_string),
-            port,
-            country: None,
-            asn: None,
-            ip: None,
-        }
-    }
-
-    #[test]
-    fn ssh_check_accepts_any_proto_with_matching_port() {
-        let rule = allow_rule(Some("any"), Some(22));
-        assert!(compound_rule_allows_ssh(&rule, 22, Some(4)));
-    }
-
-    #[test]
-    fn ssh_check_rejects_any_proto_without_other_matchers() {
-        let rule = allow_rule(Some("any"), None);
-        assert!(!compound_rule_allows_ssh(&rule, 22, Some(4)));
     }
 }
 
@@ -418,24 +193,30 @@ async fn main() -> Result<()> {
                 println!("  Restored {} rules from config", rule_count);
             }
 
-            check_ssh_safety(&mut ebpf);
+            ssh::check_ssh_safety(&mut ebpf);
             loader::attach(&mut ebpf, &iface)?;
 
             set_title(&format!("NekoFirewall | {} · whitelist", iface));
             println!("Firewall running on {} (whitelist mode, IPv4+IPv6)", iface);
             println!("  Use 'nf stop -i {}' for emergency detach", iface);
             println!("Press Ctrl+C to stop.");
-            spawn_event_readers(&mut ebpf)?;
+
+            let events_map = ebpf.take_map("EVENTS").expect("EVENTS map not found");
+            let mut perf_array = AsyncPerfEventArray::try_from(events_map)?;
+            spawn_perf_readers(&mut perf_array)?;
+            loader::set_runtime_flag(FLAG_EMIT_EVENTS, true)?;
+
             signal::ctrl_c().await?;
             info!("Shutting down...");
+            let _ = loader::set_runtime_flag(FLAG_EMIT_EVENTS, false);
             loader::cleanup_pins();
         }
         Commands::Allow { target } => match target {
-            AllowTarget::Ip { addr } => {
+            RuleTarget::Ip { addr } => {
                 rule::allow_ip(&addr)?;
                 println!("Whitelisted IP: {}", addr);
             }
-            AllowTarget::Port { proto, port } => {
+            RuleTarget::Port { proto, port } => {
                 rule::allow_port(&proto, port)?;
                 let pnum = rule::parse_proto(&proto)?;
                 if pnum == 1 || pnum == 58 {
@@ -444,37 +225,37 @@ async fn main() -> Result<()> {
                     println!("Whitelisted: {}/{}", port, proto);
                 }
             }
-            AllowTarget::Proto { proto } => {
+            RuleTarget::Proto { proto } => {
                 rule::allow_proto(&proto)?;
                 println!("Whitelisted protocol: {}", proto);
             }
-            AllowTarget::Country { code } => {
+            RuleTarget::Country { code } => {
                 geo::set_country_policy(ACTION_PASS, &code)?;
                 println!("Allowed country: {}", code.to_uppercase());
             }
-            AllowTarget::Asn { asn } => {
+            RuleTarget::Asn { asn } => {
                 geo::set_asn_policy(ACTION_PASS, asn)?;
                 println!("Allowed ASN: {}", asn);
             }
         },
         Commands::Block { target } => match target {
-            BlockTarget::Ip { addr } => {
+            RuleTarget::Ip { addr } => {
                 rule::block_ip(&addr)?;
                 println!("Removed from whitelist: {}", addr);
             }
-            BlockTarget::Port { proto, port } => {
+            RuleTarget::Port { proto, port } => {
                 rule::block_port(&proto, port)?;
                 println!("Removed from whitelist: {}/{}", port, proto);
             }
-            BlockTarget::Proto { proto } => {
+            RuleTarget::Proto { proto } => {
                 rule::block_proto(&proto)?;
                 println!("Removed protocol from whitelist: {}", proto);
             }
-            BlockTarget::Country { code } => {
+            RuleTarget::Country { code } => {
                 geo::set_country_policy(ACTION_DROP, &code)?;
                 println!("Blocked country: {}", code.to_uppercase());
             }
-            BlockTarget::Asn { asn } => {
+            RuleTarget::Asn { asn } => {
                 geo::set_asn_policy(ACTION_DROP, asn)?;
                 println!("Blocked ASN: {}", asn);
             }
@@ -490,31 +271,16 @@ async fn main() -> Result<()> {
             rule::show_conntrack()?;
         }
         Commands::Monitor => {
+            loader::set_runtime_flag(FLAG_EMIT_EVENTS, true)?;
             let map = loader::open_pinned_perf_event_array("EVENTS")?;
             let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(map)?;
 
             set_title("NekoFirewall | monitoring");
             println!("Monitoring dropped packets... (Ctrl+C to stop)");
-
-            let cpus = aya::util::online_cpus().unwrap();
-            for cpu_id in cpus {
-                let mut buf = perf_array.open(cpu_id, None)?;
-                tokio::spawn(async move {
-                    let mut buffers = (0..10)
-                        .map(|_| BytesMut::with_capacity(std::mem::size_of::<PacketLog>()))
-                        .collect::<Vec<_>>();
-                    loop {
-                        let events = buf.read_events(&mut buffers).await.unwrap();
-                        for i in 0..events.read {
-                            let ptr = buffers[i].as_ptr() as *const PacketLog;
-                            let log = unsafe { ptr.read_unaligned() };
-                            print_packet_log(&log);
-                        }
-                    }
-                });
-            }
+            spawn_perf_readers(&mut perf_array)?;
 
             signal::ctrl_c().await?;
+            let _ = loader::set_runtime_flag(FLAG_EMIT_EVENTS, false);
         }
         Commands::Stop { iface } => {
             loader::force_stop(&iface)?;
