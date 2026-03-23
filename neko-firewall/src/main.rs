@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use log::info;
 use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::process::Command;
 use tokio::signal;
 
 fn set_title(title: &str) {
@@ -175,36 +176,24 @@ fn print_packet_log(log: &PacketLog) {
     }
 }
 
-fn detect_ssh_port() -> u16 {
-    // 1. Try SSH_CONNECTION env (available in SSH sessions)
-    if let Some(port) = std::env::var("SSH_CONNECTION").ok().and_then(|conn| {
-        conn.split_whitespace()
-            .nth(3)
-            .and_then(|p| p.parse::<u16>().ok())
-    }) {
-        return port;
+fn detect_ssh_ports() -> Vec<u16> {
+    if let Some(port) = ssh_port_from_connection_env() {
+        return vec![port];
     }
 
-    // 2. Parse sshd_config (works under systemd)
-    if let Ok(content) = std::fs::read_to_string("/etc/ssh/sshd_config") {
-        for line in content.lines().rev() {
-            let line = line.trim();
-            if line.starts_with('#') || line.is_empty() {
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("Port") {
-                if let Some(port) = rest.trim().parse::<u16>().ok() {
-                    return port;
-                }
-            }
-        }
+    if let Some(ports) = ssh_ports_from_sshd() {
+        return ports;
     }
 
-    22
+    if let Some(ports) = ssh_ports_from_config() {
+        return ports;
+    }
+
+    vec![22]
 }
 
 fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
-    let ssh_port = detect_ssh_port();
+    let ssh_ports = detect_ssh_ports();
 
     let map = ebpf
         .map("ALLOWED_PORTS")
@@ -213,23 +202,99 @@ fn check_ssh_safety(ebpf: &mut aya::Ebpf) {
         aya::maps::HashMap::try_from(map).expect("ALLOWED_PORTS type mismatch");
 
     let tcp_wildcard = 6u32 << 16;
-    let ssh_key = (6u32 << 16) | ssh_port as u32;
-
-    if map.get(&tcp_wildcard, 0).is_ok()
-        || map.get(&ssh_key, 0).is_ok()
-        || ssh_allowed_by_compound_rules(ssh_port)
-    {
+    if map.get(&tcp_wildcard, 0).is_ok() {
         return;
     }
 
+    let mut missing_ports = Vec::new();
+    for ssh_port in ssh_ports.iter().copied() {
+        let ssh_key = (6u32 << 16) | ssh_port as u32;
+        if map.get(&ssh_key, 0).is_ok() || ssh_allowed_by_compound_rules(ssh_port) {
+            continue;
+        }
+        if !missing_ports.contains(&ssh_port) {
+            missing_ports.push(ssh_port);
+        }
+    }
+
+    if missing_ports.is_empty() {
+        return;
+    }
+
+    missing_ports.sort_unstable();
+    let missing_list = missing_ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
     eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     eprintln!(
-        "!  WARNING: SSH port {}/tcp is NOT in allowed rules",
-        ssh_port
+        "!  WARNING: SSH port(s) {}/tcp are NOT in allowed rules",
+        missing_list
     );
     eprintln!("!  You may lose SSH access after firewall attaches");
-    eprintln!("!  Run: nf allow port tcp {}", ssh_port);
+    if missing_ports.len() == 1 {
+        eprintln!("!  Run: nf allow port tcp {}", missing_ports[0]);
+    }
     eprintln!("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+}
+
+fn ssh_port_from_connection_env() -> Option<u16> {
+    std::env::var("SSH_CONNECTION").ok().and_then(|conn| {
+        conn.split_whitespace()
+            .nth(3)
+            .and_then(|p| p.parse::<u16>().ok())
+    })
+}
+
+fn ssh_ports_from_sshd() -> Option<Vec<u16>> {
+    for program in ["/usr/sbin/sshd", "/usr/bin/sshd", "sshd"] {
+        let Ok(output) = Command::new(program).arg("-T").output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        let ports = parse_sshd_ports(&String::from_utf8_lossy(&output.stdout));
+        if !ports.is_empty() {
+            return Some(ports);
+        }
+    }
+    None
+}
+
+fn ssh_ports_from_config() -> Option<Vec<u16>> {
+    let content = std::fs::read_to_string("/etc/ssh/sshd_config").ok()?;
+    let ports = parse_sshd_ports(&content);
+    if ports.is_empty() {
+        None
+    } else {
+        Some(ports)
+    }
+}
+
+fn parse_sshd_ports(content: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if !matches!(parts.next(), Some(keyword) if keyword.eq_ignore_ascii_case("port")) {
+            continue;
+        }
+        if let Some(value) = parts.next() {
+            if let Ok(port) = value.parse::<u16>() {
+                ports.push(port);
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 fn ssh_allowed_by_compound_rules(ssh_port: u16) -> bool {
