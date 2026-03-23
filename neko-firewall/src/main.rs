@@ -327,12 +327,17 @@ fn compound_rule_allows_ssh(
         return false;
     }
 
-    if rule_entry.proto.is_none() && rule_entry.port.is_none() {
+    let has_specific_proto = rule_entry
+        .proto
+        .as_deref()
+        .is_some_and(|proto| !proto.eq_ignore_ascii_case("any"));
+
+    if !has_specific_proto && rule_entry.port.is_none() {
         return false;
     }
 
     if let Some(proto) = &rule_entry.proto {
-        if !proto.eq_ignore_ascii_case("tcp") {
+        if !proto.eq_ignore_ascii_case("tcp") && !proto.eq_ignore_ascii_case("any") {
             return false;
         }
     }
@@ -355,6 +360,35 @@ fn compound_rule_allows_ssh(
         Ok(rule::CidrAddr::V4(_, _)) => ssh_family == 4,
         Ok(rule::CidrAddr::V6(_, _)) => ssh_family == 6,
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compound_rule_allows_ssh;
+    use crate::config::CompoundRuleEntry;
+
+    fn allow_rule(proto: Option<&str>, port: Option<u16>) -> CompoundRuleEntry {
+        CompoundRuleEntry {
+            action: "allow".into(),
+            proto: proto.map(str::to_string),
+            port,
+            country: None,
+            asn: None,
+            ip: None,
+        }
+    }
+
+    #[test]
+    fn ssh_check_accepts_any_proto_with_matching_port() {
+        let rule = allow_rule(Some("any"), Some(22));
+        assert!(compound_rule_allows_ssh(&rule, 22, Some(4)));
+    }
+
+    #[test]
+    fn ssh_check_rejects_any_proto_without_other_matchers() {
+        let rule = allow_rule(Some("any"), None);
+        assert!(!compound_rule_allows_ssh(&rule, 22, Some(4)));
     }
 }
 

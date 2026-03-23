@@ -370,8 +370,10 @@ impl CompoundRuleEntry {
         bpf_rule.action = action;
 
         if let Some(ref p) = self.proto {
-            bpf_rule.proto = parse_proto_num(p)?;
-            bpf_rule.match_fields |= MATCH_PROTO;
+            if !p.eq_ignore_ascii_case("any") {
+                bpf_rule.proto = parse_proto_num(p)?;
+                bpf_rule.match_fields |= MATCH_PROTO;
+            }
         }
         if let Some(port) = self.port {
             bpf_rule.port = port;
@@ -404,6 +406,10 @@ impl CompoundRuleEntry {
             }
             bpf_rule.match_fields |= MATCH_IP;
         }
+        if bpf_rule.match_fields == 0 {
+            return None;
+        }
+
         Some(bpf_rule)
     }
 }
@@ -430,5 +436,41 @@ fn parse_proto_num(proto: &str) -> Option<u8> {
         "icmp" => Some(1),
         "icmpv6" | "ipv6-icmp" => Some(58),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompoundRuleEntry, MATCH_PORT};
+
+    #[test]
+    fn any_proto_keeps_other_matchers() {
+        let entry = CompoundRuleEntry {
+            action: "allow".into(),
+            proto: Some("any".into()),
+            port: Some(53),
+            country: None,
+            asn: None,
+            ip: None,
+        };
+
+        let rule = entry.to_bpf_rule().expect("rule should be valid");
+        assert_eq!(rule.match_fields, MATCH_PORT);
+        assert_eq!(rule.proto, 0);
+        assert_eq!(rule.port, 53);
+    }
+
+    #[test]
+    fn any_proto_needs_another_matcher() {
+        let entry = CompoundRuleEntry {
+            action: "allow".into(),
+            proto: Some("any".into()),
+            port: None,
+            country: None,
+            asn: None,
+            ip: None,
+        };
+
+        assert!(entry.to_bpf_rule().is_none());
     }
 }

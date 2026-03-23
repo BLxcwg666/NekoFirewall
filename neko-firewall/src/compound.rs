@@ -22,8 +22,10 @@ pub fn add_rule(
     bpf_rule.action = action;
 
     if let Some(p) = proto {
-        bpf_rule.proto = parse_proto(p)?;
-        bpf_rule.match_fields |= MATCH_PROTO;
+        if !is_any_proto(p) {
+            bpf_rule.proto = parse_proto(p)?;
+            bpf_rule.match_fields |= MATCH_PROTO;
+        }
     }
     if let Some(p) = port {
         bpf_rule.port = p;
@@ -58,6 +60,9 @@ pub fn add_rule(
     }
 
     if bpf_rule.match_fields == 0 {
+        if matches!(proto, Some(p) if is_any_proto(p)) {
+            bail!("--proto any must be combined with --port, --country, --asn, or --ip");
+        }
         bail!("At least one condition is required (--proto, --port, --country, --asn, --ip)");
     }
 
@@ -136,4 +141,8 @@ fn parse_proto(proto: &str) -> Result<u8> {
             proto
         ),
     }
+}
+
+fn is_any_proto(proto: &str) -> bool {
+    proto.eq_ignore_ascii_case("any")
 }
