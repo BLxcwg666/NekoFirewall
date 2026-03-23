@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use aya::maps::lpm_trie::Key;
 use aya::maps::HashMap;
 use log::info;
-use neko_common::{ConnTrackKey, ConnTrackKey6, ACTION_PASS};
+use neko_common::{port_key, ConnTrackKey, ConnTrackKey6, ACTION_PASS};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::config::Config;
@@ -92,7 +92,7 @@ pub fn block_ip(cidr: &str) -> Result<()> {
 
 pub fn allow_port(proto: &str, port: u16) -> Result<()> {
     let proto_num = parse_proto(proto)?;
-    let key = (proto_num as u32) << 16 | port as u32;
+    let key = port_key(proto_num, port);
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.insert(key, ACTION_PASS, 0)?;
     let label = if proto_num == 1 || proto_num == 58 {
@@ -110,7 +110,7 @@ pub fn allow_port(proto: &str, port: u16) -> Result<()> {
 
 pub fn block_port(proto: &str, port: u16) -> Result<()> {
     let proto_num = parse_proto(proto)?;
-    let key = (proto_num as u32) << 16 | port as u32;
+    let key = port_key(proto_num, port);
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.remove(&key)?;
     info!("Removed from whitelist: {} {}", proto, port);
@@ -123,7 +123,7 @@ pub fn block_port(proto: &str, port: u16) -> Result<()> {
 
 pub fn allow_proto(proto: &str) -> Result<()> {
     let proto_num = parse_proto(proto)?;
-    let key = (proto_num as u32) << 16; // port=0 as wildcard
+    let key = port_key(proto_num, 0); // port=0 as wildcard
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.insert(key, ACTION_PASS, 0)?;
     info!("Whitelisted protocol: {}", proto);
@@ -136,7 +136,7 @@ pub fn allow_proto(proto: &str) -> Result<()> {
 
 pub fn block_proto(proto: &str) -> Result<()> {
     let proto_num = parse_proto(proto)?;
-    let key = (proto_num as u32) << 16;
+    let key = port_key(proto_num, 0);
     let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
     map.remove(&key)?;
     info!("Removed protocol from whitelist: {}", proto);
@@ -147,15 +147,7 @@ pub fn block_proto(proto: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn proto_name(num: u8) -> &'static str {
-    match num {
-        1 => "icmp",
-        6 => "tcp",
-        17 => "udp",
-        58 => "icmpv6",
-        _ => "unknown",
-    }
-}
+pub use neko_common::proto_name;
 
 pub fn list_rules() -> Result<()> {
     println!("=== Whitelisted IPs (IPv4) ===");
@@ -292,14 +284,10 @@ pub fn show_conntrack() -> Result<()> {
 }
 
 pub fn parse_proto(proto: &str) -> Result<u8> {
-    match proto.to_lowercase().as_str() {
-        "tcp" => Ok(6),
-        "udp" => Ok(17),
-        "icmp" => Ok(1),
-        "icmpv6" | "ipv6-icmp" => Ok(58),
-        _ => bail!(
+    neko_common::parse_proto(proto).ok_or_else(|| {
+        anyhow::anyhow!(
             "Unsupported protocol: {} (use tcp, udp, icmp, or icmpv6)",
             proto
-        ),
-    }
+        )
+    })
 }

@@ -1,13 +1,11 @@
 use anyhow::{bail, Result};
 use log::info;
-use neko_common::{
-    CompoundRule, MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO, MAX_COMPOUND_RULES,
-};
+use neko_common::MAX_COMPOUND_RULES;
 
 use crate::{
     config::{CompoundRuleEntry, Config},
     geo,
-    rule::{self, CidrAddr},
+    rule,
 };
 
 pub fn add_rule(
@@ -18,49 +16,26 @@ pub fn add_rule(
     asn: Option<u32>,
     ip: Option<&str>,
 ) -> Result<u32> {
-    let mut bpf_rule = CompoundRule::default();
-    bpf_rule.action = action;
-
+    // Validate proto if specified and not "any"
     if let Some(p) = proto {
-        if !is_any_proto(p) {
-            bpf_rule.proto = parse_proto(p)?;
-            bpf_rule.match_fields |= MATCH_PROTO;
+        if !p.eq_ignore_ascii_case("any") {
+            rule::parse_proto(p)?;
         }
     }
-    if let Some(p) = port {
-        bpf_rule.port = p;
-        bpf_rule.match_fields |= MATCH_PORT;
-    }
+    // Validate country code
     if let Some(c) = country {
-        bpf_rule.country_id = geo::country_to_id(c)?;
-        bpf_rule.match_fields |= MATCH_COUNTRY;
+        geo::country_to_id(c)?;
     }
-    if let Some(a) = asn {
-        bpf_rule.asn_id = 0x80000000 | a;
-        bpf_rule.match_fields |= MATCH_ASN;
-    }
+    // Validate IP/CIDR
     if let Some(cidr) = ip {
-        match rule::parse_cidr(cidr)? {
-            CidrAddr::V4(addr, prefix) => {
-                let bytes = u32::from(addr).to_be().to_ne_bytes();
-                bpf_rule.src_ip[0] = bytes[0];
-                bpf_rule.src_ip[1] = bytes[1];
-                bpf_rule.src_ip[2] = bytes[2];
-                bpf_rule.src_ip[3] = bytes[3];
-                bpf_rule.prefix_len = prefix;
-                bpf_rule.family = 4;
-            }
-            CidrAddr::V6(addr, prefix) => {
-                bpf_rule.src_ip = addr.octets();
-                bpf_rule.prefix_len = prefix;
-                bpf_rule.family = 6;
-            }
-        }
-        bpf_rule.match_fields |= MATCH_IP;
+        rule::parse_cidr(cidr)?;
     }
 
-    if bpf_rule.match_fields == 0 {
-        if matches!(proto, Some(p) if is_any_proto(p)) {
+    let entry = CompoundRuleEntry::new(action, proto, port, country, asn, ip);
+
+    // Validate the entry can produce a valid BPF rule
+    if entry.to_bpf_rule().is_none() {
+        if matches!(proto, Some(p) if p.eq_ignore_ascii_case("any")) {
             bail!("--proto any must be combined with --port, --country, --asn, or --ip");
         }
         bail!("At least one condition is required (--proto, --port, --country, --asn, --ip)");
@@ -71,10 +46,7 @@ pub fn add_rule(
         bail!("No free rule slots (max {})", MAX_COMPOUND_RULES);
     }
     let index = cfg.rules.len() as u32;
-    let _ = bpf_rule;
-    cfg.add_compound_rule(CompoundRuleEntry::new(
-        action, proto, port, country, asn, ip,
-    ));
+    cfg.add_compound_rule(entry);
     cfg.save()?;
     cfg.apply_compound_rules()?;
     info!("Added compound rule at slot {}", index);
@@ -128,21 +100,4 @@ pub fn list_rules() -> Result<()> {
         println!("  (none)");
     }
     Ok(())
-}
-
-fn parse_proto(proto: &str) -> Result<u8> {
-    match proto.to_lowercase().as_str() {
-        "tcp" => Ok(6),
-        "udp" => Ok(17),
-        "icmp" => Ok(1),
-        "icmpv6" | "ipv6-icmp" => Ok(58),
-        _ => bail!(
-            "Unsupported protocol: {} (use tcp, udp, icmp, or icmpv6)",
-            proto
-        ),
-    }
-}
-
-fn is_any_proto(proto: &str) -> bool {
-    proto.eq_ignore_ascii_case("any")
 }

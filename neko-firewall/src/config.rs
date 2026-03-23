@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use aya::maps::{lpm_trie::Key, Array, HashMap};
 use neko_common::{
-    CompoundRule, ACTION_DROP, ACTION_PASS, FLAG_EMIT_EVENTS, MATCH_ASN, MATCH_COUNTRY, MATCH_IP,
-    MATCH_PORT, MATCH_PROTO, MAX_COMPOUND_RULES,
+    port_key, CompoundRule, ASN_FLAG, ACTION_DROP, ACTION_PASS, MATCH_ASN, MATCH_COUNTRY,
+    MATCH_IP, MATCH_PORT, MATCH_PROTO, MAX_COMPOUND_RULES,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -108,9 +108,8 @@ impl Config {
             let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
             for port_str in &self.allow.ports {
                 if let Some((proto, port)) = parse_port_entry(port_str) {
-                    let proto_num = parse_proto_num(proto);
-                    if let Some(num) = proto_num {
-                        let key = (num as u32) << 16 | port as u32;
+                    if let Some(num) = neko_common::parse_proto(proto) {
+                        let key = port_key(num, port);
                         map.insert(key, ACTION_PASS, 0)?;
                     } else {
                         eprintln!("  Warning: skipping unknown protocol '{}'", proto);
@@ -125,8 +124,8 @@ impl Config {
         if !self.allow.protocols.is_empty() {
             let mut map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
             for proto in &self.allow.protocols {
-                if let Some(num) = parse_proto_num(proto) {
-                    let key = (num as u32) << 16;
+                if let Some(num) = neko_common::parse_proto(proto) {
+                    let key = port_key(num, 0);
                     map.insert(key, ACTION_PASS, 0)?;
                 } else {
                     eprintln!("  Warning: skipping unknown protocol '{}'", proto);
@@ -152,10 +151,10 @@ impl Config {
                 }
             }
             for &asn in &self.allow.asns {
-                map.insert(0x80000000 | asn, ACTION_PASS, 0)?;
+                map.insert(ASN_FLAG | asn, ACTION_PASS, 0)?;
             }
             for &asn in &self.block.asns {
-                map.insert(0x80000000 | asn, ACTION_DROP, 0)?;
+                map.insert(ASN_FLAG | asn, ACTION_DROP, 0)?;
             }
         }
 
@@ -251,21 +250,6 @@ impl Config {
             + self.block.countries.len()
             + self.block.asns.len()
             + self.rules.len()
-    }
-
-    pub fn runtime_policy_flags(&self) -> u32 {
-        0
-    }
-
-    pub fn sync_runtime_policy_flags(&self) -> Result<()> {
-        let Ok(mut map) = loader::open_pinned_hashmap::<u32, u32>("RUNTIME_FLAGS") else {
-            return Ok(());
-        };
-        let key = 0u32;
-        let current = map.get(&key, 0).ok().unwrap_or(0);
-        let flags = self.runtime_policy_flags() | (current & FLAG_EMIT_EVENTS);
-        map.insert(key, flags, 0)?;
-        Ok(())
     }
 
     pub fn add_ip(&mut self, cidr: &str) {
@@ -371,7 +355,7 @@ impl CompoundRuleEntry {
 
         if let Some(ref p) = self.proto {
             if !p.eq_ignore_ascii_case("any") {
-                bpf_rule.proto = parse_proto_num(p)?;
+                bpf_rule.proto = neko_common::parse_proto(p)?;
                 bpf_rule.match_fields |= MATCH_PROTO;
             }
         }
@@ -384,24 +368,16 @@ impl CompoundRuleEntry {
             bpf_rule.match_fields |= MATCH_COUNTRY;
         }
         if let Some(asn) = self.asn {
-            bpf_rule.asn_id = 0x80000000 | asn;
+            bpf_rule.asn_id = ASN_FLAG | asn;
             bpf_rule.match_fields |= MATCH_ASN;
         }
         if let Some(ref ip_str) = self.ip {
             match rule::parse_cidr(ip_str).ok()? {
                 CidrAddr::V4(addr, prefix) => {
-                    let bytes = u32::from(addr).to_be().to_ne_bytes();
-                    bpf_rule.src_ip[0] = bytes[0];
-                    bpf_rule.src_ip[1] = bytes[1];
-                    bpf_rule.src_ip[2] = bytes[2];
-                    bpf_rule.src_ip[3] = bytes[3];
-                    bpf_rule.prefix_len = prefix;
-                    bpf_rule.family = 4;
+                    bpf_rule.set_ipv4(u32::from(addr).to_be(), prefix);
                 }
                 CidrAddr::V6(addr, prefix) => {
-                    bpf_rule.src_ip = addr.octets();
-                    bpf_rule.prefix_len = prefix;
-                    bpf_rule.family = 6;
+                    bpf_rule.set_ipv6(addr.octets(), prefix);
                 }
             }
             bpf_rule.match_fields |= MATCH_IP;
@@ -415,28 +391,13 @@ impl CompoundRuleEntry {
 }
 
 fn format_port_entry(proto: &str, port: u16) -> String {
-    let p = proto.to_lowercase();
-    if p == "icmp" || p == "icmpv6" || p == "ipv6-icmp" {
-        format!("{}/{}", p, port)
-    } else {
-        format!("{}/{}", p, port)
-    }
+    format!("{}/{}", proto.to_lowercase(), port)
 }
 
 fn parse_port_entry(s: &str) -> Option<(&str, u16)> {
     let (proto, port_str) = s.split_once('/')?;
     let port = port_str.parse().ok()?;
     Some((proto, port))
-}
-
-fn parse_proto_num(proto: &str) -> Option<u8> {
-    match proto.to_lowercase().as_str() {
-        "tcp" => Some(6),
-        "udp" => Some(17),
-        "icmp" => Some(1),
-        "icmpv6" | "ipv6-icmp" => Some(58),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use aya::maps::lpm_trie::{Key, LpmTrie};
 use ipnetwork::IpNetwork;
 use log::info;
 use maxminddb::geoip2;
+use neko_common::ASN_FLAG;
 
 use crate::loader;
 
@@ -120,7 +121,7 @@ pub fn load_asn_map(ebpf: &mut aya::Ebpf) -> Result<(usize, usize)> {
         let record: Option<geoip2::Asn> = item.decode()?;
         if let Some(record) = record {
             if let Some(asn) = record.autonomous_system_number {
-                let asn_id = 0x80000000 | asn;
+                let asn_id = ASN_FLAG | asn;
                 match item.network() {
                     Ok(IpNetwork::V4(net)) => {
                         let prefix_len = net.prefix() as u32;
@@ -170,7 +171,7 @@ pub fn set_country_policy(action: u32, code: &str) -> Result<()> {
 }
 
 pub fn set_asn_policy(action: u32, asn: u32) -> Result<()> {
-    let asn_id = 0x80000000 | asn;
+    let asn_id = ASN_FLAG | asn;
     let mut map = open_geo_policy()?;
     map.insert(asn_id, action, 0)?;
 
@@ -186,8 +187,8 @@ pub fn list_policies() -> Result<()> {
     for res in map.iter() {
         let (id, action) = res.context("Failed to read geo policy")?;
         let action_str = if action == 0 { "ALLOW" } else { "DROP" };
-        if id & 0x80000000 != 0 {
-            println!("  {} ASN {}", action_str, id & 0x7FFFFFFF);
+        if id & ASN_FLAG != 0 {
+            println!("  {} ASN {}", action_str, id & !ASN_FLAG);
         } else {
             println!("  {} country {}", action_str, id_to_country(id));
         }

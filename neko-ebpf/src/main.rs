@@ -15,6 +15,7 @@ use neko_common::{
     ACTION_PASS, FLAG_EMIT_EVENTS, MATCH_ASN, MATCH_COUNTRY, MATCH_IP, MATCH_PORT, MATCH_PROTO,
     MAX_COMPOUND_RULES, RULES_PER_STAGE, RULE_PIPELINE_SIZE, RULE_PIPELINE_V4_BASE,
     RULE_PIPELINE_V4_POST, RULE_PIPELINE_V6_BASE, RULE_PIPELINE_V6_POST, RULE_STAGE_COUNT,
+    port_key,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -97,6 +98,8 @@ fn ptr_at<T>(start: usize, end: usize, offset: usize) -> Result<*const T, ()> {
 
 #[inline(always)]
 fn ipv4_header_len(ipv4hdr: *const Ipv4Hdr) -> Result<usize, ()> {
+    // Intentionally reject packets with IP options (IHL != 5).
+    // This simplifies parsing and drops uncommon/suspicious traffic.
     let ihl = unsafe { (*ipv4hdr).ihl() };
     if ihl != 5 {
         return Err(());
@@ -613,13 +616,13 @@ fn post_rules_v4_action(packet: &PacketCtxV4, ctx: &XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
 
-    let proto_wildcard = (packet.proto as u32) << 16;
+    let proto_wildcard = port_key(packet.proto, 0);
     if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
         return xdp_action::XDP_PASS;
     }
     if packet.dst_port > 0 {
-        let port_key = (packet.proto as u32) << 16 | packet.dst_port as u32;
-        if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
+        let pk = port_key(packet.proto, packet.dst_port);
+        if unsafe { ALLOWED_PORTS.get(&pk) }.is_some() {
             return xdp_action::XDP_PASS;
         }
     }
@@ -698,13 +701,13 @@ fn post_rules_v6_action(packet: &PacketCtxV6, ctx: &XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
 
-    let proto_wildcard = (packet.proto as u32) << 16;
+    let proto_wildcard = port_key(packet.proto, 0);
     if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
         return xdp_action::XDP_PASS;
     }
     if packet.dst_port > 0 {
-        let port_key = (packet.proto as u32) << 16 | packet.dst_port as u32;
-        if unsafe { ALLOWED_PORTS.get(&port_key) }.is_some() {
+        let pk = port_key(packet.proto, packet.dst_port);
+        if unsafe { ALLOWED_PORTS.get(&pk) }.is_some() {
             return xdp_action::XDP_PASS;
         }
     }
@@ -800,23 +803,16 @@ fn try_egress_v6(start: usize, end: usize) -> Result<i32, ()> {
     let next_hdr = unsafe { (*ipv6hdr).next_hdr };
     let transport_offset = EthHdr::LEN + Ipv6Hdr::LEN;
 
-    let (raw_src_port, raw_dst_port) = match next_hdr {
+    let (raw_src_port, raw_dst_port, proto_num) = match next_hdr {
         IpProto::Tcp => {
             let tcphdr: *const TcpHdr = ptr_at(start, end, transport_offset)?;
-            (unsafe { (*tcphdr).source }, unsafe { (*tcphdr).dest })
+            (unsafe { (*tcphdr).source }, unsafe { (*tcphdr).dest }, 6u8)
         }
         IpProto::Udp => {
             let udphdr: *const UdpHdr = ptr_at(start, end, transport_offset)?;
-            (unsafe { (*udphdr).source }, unsafe { (*udphdr).dest })
+            (unsafe { (*udphdr).source }, unsafe { (*udphdr).dest }, 17u8)
         }
-        IpProto::Ipv6Icmp => (0u16, 0u16),
-        _ => return Ok(0),
-    };
-
-    let proto_num = match next_hdr {
-        IpProto::Tcp => 6u8,
-        IpProto::Udp => 17u8,
-        IpProto::Ipv6Icmp => 58u8,
+        IpProto::Ipv6Icmp => (0u16, 0u16, 58u8),
         _ => return Ok(0),
     };
 
