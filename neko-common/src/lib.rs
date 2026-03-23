@@ -11,6 +11,15 @@ pub const MATCH_COUNTRY: u32 = 4;
 pub const MATCH_ASN: u32 = 8;
 pub const MATCH_IP: u32 = 16;
 
+/// High bit flag to distinguish ASN IDs from country IDs in GEO_POLICY map.
+pub const ASN_FLAG: u32 = 0x80000000;
+
+/// Encode protocol number and port into a single u32 key for ALLOWED_PORTS map.
+#[inline(always)]
+pub const fn port_key(proto: u8, port: u16) -> u32 {
+    (proto as u32) << 16 | port as u32
+}
+
 pub const MAX_COMPOUND_RULES: u32 = 128;
 pub const RULES_PER_STAGE: u32 = 16;
 pub const RULE_STAGE_COUNT: u32 = (MAX_COMPOUND_RULES + RULES_PER_STAGE - 1) / RULES_PER_STAGE;
@@ -141,3 +150,46 @@ unsafe impl aya::Pod for PacketCtxV4 {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PacketCtxV6 {}
+
+#[cfg(feature = "user")]
+impl CompoundRule {
+    /// Fill src_ip from an IPv4 address (network byte order u32).
+    pub fn set_ipv4(&mut self, addr_be: u32, prefix: u8) {
+        let bytes = addr_be.to_ne_bytes();
+        self.src_ip[0] = bytes[0];
+        self.src_ip[1] = bytes[1];
+        self.src_ip[2] = bytes[2];
+        self.src_ip[3] = bytes[3];
+        self.prefix_len = prefix;
+        self.family = 4;
+    }
+
+    /// Fill src_ip from an IPv6 address octets.
+    pub fn set_ipv6(&mut self, addr: [u8; 16], prefix: u8) {
+        self.src_ip = addr;
+        self.prefix_len = prefix;
+        self.family = 6;
+    }
+}
+
+#[cfg(feature = "user")]
+pub fn parse_proto(proto: &str) -> Option<u8> {
+    match proto.to_lowercase().as_str() {
+        "tcp" => Some(6),
+        "udp" => Some(17),
+        "icmp" => Some(1),
+        "icmpv6" | "ipv6-icmp" => Some(58),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "user")]
+pub fn proto_name(num: u8) -> &'static str {
+    match num {
+        1 => "icmp",
+        6 => "tcp",
+        17 => "udp",
+        58 => "icmpv6",
+        _ => "unknown",
+    }
+}
