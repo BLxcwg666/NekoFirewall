@@ -47,6 +47,12 @@ pub struct HoneypotConfig {
     /// Optional Server header for the decoy response (default "nginx").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_header: Option<String>,
+    /// Embed an encrypted watermark token in responses (header + body comment).
+    /// Off by default: the decoy is then a byte-identical nginx page, and hits
+    /// are still captured via the log/notification. Turn on for counter-mapping
+    /// (so a scanning platform indexes a token you can later decode/search).
+    #[serde(default)]
+    pub watermark: bool,
 }
 
 fn default_honeypot_log() -> String {
@@ -62,6 +68,7 @@ impl Default for HoneypotConfig {
             log_path: default_honeypot_log(),
             notify_command: None,
             server_header: None,
+            watermark: false,
         }
     }
 }

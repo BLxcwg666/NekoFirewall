@@ -68,6 +68,9 @@ enum HoneypotAction {
         secret: Option<String>,
         #[arg(long)]
         notify_command: Option<String>,
+        /// Embed an encrypted watermark token in responses (for counter-mapping).
+        #[arg(long)]
+        watermark: bool,
     },
     /// Disable the honeypot (config is kept).
     Disable,
@@ -365,14 +368,17 @@ async fn main() -> Result<()> {
                 port,
                 secret,
                 notify_command,
+                watermark,
             } => {
                 let mut cfg = config::Config::load()?;
                 cfg.honeypot.enabled = true;
                 cfg.honeypot.ports = port;
+                cfg.honeypot.watermark = watermark;
                 if let Some(s) = secret {
                     cfg.honeypot.secret = s;
                 }
-                if cfg.honeypot.secret.is_empty() {
+                // A secret is only needed in watermark mode (to derive the key).
+                if cfg.honeypot.watermark && cfg.honeypot.secret.is_empty() {
                     cfg.honeypot.secret = honeypot::generate_secret();
                     println!(
                         "Generated honeypot secret (store it — needed to decode tokens):\n  {}",
@@ -384,8 +390,8 @@ async fn main() -> Result<()> {
                 }
                 cfg.save()?;
                 println!(
-                    "Honeypot enabled on tcp {:?}. Restart 'nf run' to activate.",
-                    cfg.honeypot.ports
+                    "Honeypot enabled on tcp {:?} (watermark: {}). Restart 'nf run' to activate.",
+                    cfg.honeypot.ports, cfg.honeypot.watermark
                 );
             }
             HoneypotAction::Disable => {
@@ -405,15 +411,16 @@ async fn main() -> Result<()> {
             HoneypotAction::Status => {
                 let cfg = config::Config::load()?;
                 let hp = &cfg.honeypot;
-                println!("enabled: {}", hp.enabled);
-                println!("ports:   {:?}", hp.ports);
-                println!("log:     {}", hp.log_path);
+                println!("enabled:   {}", hp.enabled);
+                println!("ports:     {:?}", hp.ports);
+                println!("watermark: {}", hp.watermark);
+                println!("log:       {}", hp.log_path);
                 println!(
-                    "notify:  {}",
+                    "notify:    {}",
                     hp.notify_command.as_deref().unwrap_or("(none)")
                 );
                 println!(
-                    "secret:  {}",
+                    "secret:    {}",
                     if hp.secret.is_empty() {
                         "(unset)"
                     } else {

@@ -27,6 +27,37 @@ const TOKEN_PREFIX: &str = "NEKO1.";
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_REQUEST: usize = 4096;
 
+/// Byte-exact copy of nginx's default `index.html` (docs/html/index.html),
+/// LF line endings, so the decoy is indistinguishable from a stock install.
+const NGINX_PAGE: &str = "\
+<!DOCTYPE html>\n\
+<html>\n\
+<head>\n\
+<title>Welcome to nginx!</title>\n\
+<style>\n\
+html { color-scheme: light dark; }\n\
+body { width: 35em; margin: 0 auto;\n\
+font-family: Tahoma, Verdana, Arial, sans-serif; }\n\
+</style>\n\
+</head>\n\
+<body>\n\
+<h1>Welcome to nginx!</h1>\n\
+<p>If you see this page, nginx is successfully installed and working.\n\
+Further configuration is required for the web server, reverse proxy, \n\
+API gateway, load balancer, content cache, or other features.</p>\n\
+\n\
+<p>For online documentation and support please refer to\n\
+<a href=\"https://nginx.org/\">nginx.org</a>.<br/>\n\
+To engage with the community please visit\n\
+<a href=\"https://community.nginx.org/\">community.nginx.org</a>.<br/>\n\
+For enterprise grade support, professional services, additional \n\
+security features and capabilities please refer to\n\
+<a href=\"https://f5.com/nginx\">f5.com/nginx</a>.</p>\n\
+\n\
+<p><em>Thank you for using nginx.</em></p>\n\
+</body>\n\
+</html>\n";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VisitorInfo {
     ip: String,
@@ -42,7 +73,8 @@ struct VisitorInfo {
 struct HitRecord<'a> {
     #[serde(flatten)]
     visitor: &'a VisitorInfo,
-    token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<&'a str>,
     dst_port: u16,
 }
 
@@ -108,21 +140,35 @@ async fn handle(
         ua,
     };
 
-    let token = encode_token(key, &visitor)?;
-    record_hit(cfg, &visitor, &token, dst_port).await;
+    // The watermark token is only computed/embedded when explicitly enabled.
+    // By default the honeypot stays a byte-identical nginx page (every hit is
+    // still captured via the notification + log), so it can't be fingerprinted
+    // as a honeypot by the tag itself.
+    let token = if cfg.watermark {
+        Some(encode_token(key, &visitor)?)
+    } else {
+        None
+    };
+    record_hit(cfg, &visitor, token.as_deref(), dst_port).await;
 
-    let body = build_body(&token);
+    let body = build_body(token.as_deref());
     let server = cfg.server_header.as_deref().unwrap_or("nginx");
+    let tag_header = match token.as_deref() {
+        Some(t) => format!("X-Neko-Tag: {}\r\n", t),
+        None => String::new(),
+    };
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
          Server: {server}\r\n\
-         Content-Type: text/html; charset=utf-8\r\n\
+         Date: {date}\r\n\
+         Content-Type: text/html\r\n\
          Content-Length: {len}\r\n\
-         X-Neko-Tag: {token}\r\n\
-         Connection: close\r\n\r\n{body}",
+         Connection: close\r\n\
+         {tag}\r\n{body}",
         server = server,
+        date = http_date(now_secs()),
         len = body.len(),
-        token = token,
+        tag = tag_header,
         body = body,
     );
     let _ = stream.write_all(response.as_bytes()).await;
@@ -130,16 +176,13 @@ async fn handle(
     Ok(())
 }
 
-fn build_body(token: &str) -> String {
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta name=\"neko-tag\" content=\"{t}\">\
-         <title>It works</title></head>\
-         <body><h1>It works!</h1>\
-         <p>This site is under maintenance.</p>\
-         <!-- {t} --></body></html>",
-        t = token
-    )
+fn build_body(token: Option<&str>) -> String {
+    match token {
+        // Watermark mode: append the token as a trailing comment so a mapping
+        // platform indexes it, while the visible page is still vanilla nginx.
+        Some(t) => format!("{}<!-- {} -->\n", NGINX_PAGE, t),
+        None => NGINX_PAGE.to_string(),
+    }
 }
 
 /// Best-effort parse of the request line and a couple of headers. Returns
@@ -180,16 +223,50 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-async fn record_hit(cfg: &HoneypotConfig, visitor: &VisitorInfo, token: &str, dst_port: u16) {
+/// Format a Unix timestamp as an RFC 7231 HTTP-date (always GMT), so the decoy
+/// carries a normal `Date:` header like a real server.
+fn http_date(secs: u64) -> String {
+    const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = (secs / 86400) as i64;
+    let sod = secs % 86400;
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    // 1970-01-01 was a Thursday.
+    let dow = (((days % 7 + 7) % 7) + 4) % 7;
+    // civil_from_days (Howard Hinnant).
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        DOW[dow as usize],
+        d,
+        MON[(m - 1) as usize],
+        year,
+        hh,
+        mm,
+        ss
+    )
+}
+
+async fn record_hit(cfg: &HoneypotConfig, visitor: &VisitorInfo, token: Option<&str>, dst_port: u16) {
     log::warn!(
-        "[honeypot] HIT :{} from {}:{} {} {} ua={:?} token={}",
+        "[honeypot] HIT :{} from {}:{} {} {} ua={:?}",
         dst_port,
         visitor.ip,
         visitor.port,
         visitor.method,
         visitor.path,
         visitor.ua,
-        token
     );
 
     let record = HitRecord {
@@ -204,7 +281,7 @@ async fn record_hit(cfg: &HoneypotConfig, visitor: &VisitorInfo, token: &str, ds
     }
 
     if let Some(cmd) = cfg.notify_command.as_deref() {
-        fire_notify(cmd, visitor, token, dst_port, &json).await;
+        fire_notify(cmd, visitor, token.unwrap_or(""), dst_port, &json).await;
     }
 }
 
@@ -320,7 +397,7 @@ pub fn generate_secret() -> String {
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fn b64url_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -374,6 +451,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nginx_page_matches_upstream_size() {
+        // nginx's current default index.html is 896 bytes; guard byte fidelity.
+        assert_eq!(NGINX_PAGE.len(), 896);
+        let _ = std::fs::write(
+            std::env::temp_dir().join("neko-nginx-page.html"),
+            NGINX_PAGE,
+        );
+    }
+
+    #[test]
     fn base64url_roundtrip() {
         for len in 0..40 {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
@@ -414,6 +501,7 @@ mod tests {
             log_path: log_path.to_string_lossy().into_owned(),
             notify_command: None,
             server_header: None,
+            watermark: true,
         };
         serve(cfg);
 
@@ -450,5 +538,46 @@ mod tests {
         assert!(json.contains("/secret-path"), "json: {}", json);
         assert!(json.contains("zgrab/0.x"), "json: {}", json);
         assert!(json.contains("127.0.0.1"), "json: {}", json);
+    }
+
+    #[tokio::test]
+    async fn stealth_mode_serves_plain_nginx() {
+        let log_path = std::env::temp_dir().join("neko-hp-stealth.jsonl");
+        let cfg = HoneypotConfig {
+            enabled: true,
+            ports: vec![39518],
+            secret: String::new(),
+            log_path: log_path.to_string_lossy().into_owned(),
+            notify_command: None,
+            server_header: None,
+            watermark: false,
+        };
+        serve(cfg);
+
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", 39518)).await {
+                stream = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut s = stream.expect("connect to honeypot");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+
+        let mut resp = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => resp.extend_from_slice(&buf[..n]),
+            }
+        }
+        let text = String::from_utf8_lossy(&resp);
+        // No watermark leakage, and the body is byte-identical to nginx's page.
+        assert!(!text.contains("X-Neko-Tag"), "resp: {}", text);
+        assert!(!text.contains("NEKO1."), "resp: {}", text);
+        let body = text.split("\r\n\r\n").nth(1).expect("has body");
+        assert_eq!(body, NGINX_PAGE);
     }
 }
