@@ -1,6 +1,7 @@
 mod compound;
 mod config;
 mod geo;
+mod honeypot;
 mod loader;
 mod rule;
 mod ssh;
@@ -10,7 +11,7 @@ use aya::maps::perf::AsyncPerfEventArray;
 use bytes::BytesMut;
 use clap::{Parser, Subcommand};
 use log::info;
-use neko_common::{PacketLog, ACTION_DROP, ACTION_PASS, FLAG_EMIT_EVENTS};
+use neko_common::{port_key, PacketLog, ACTION_DROP, ACTION_PASS, FLAG_EMIT_EVENTS};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::signal;
 
@@ -51,6 +52,29 @@ enum Commands {
         #[command(subcommand)]
         action: RuleAction,
     },
+    Honeypot {
+        #[command(subcommand)]
+        action: HoneypotAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HoneypotAction {
+    /// Enable the honeypot on one or more TCP ports (open to all sources).
+    Enable {
+        #[arg(short, long, required = true)]
+        port: Vec<u16>,
+        #[arg(long)]
+        secret: Option<String>,
+        #[arg(long)]
+        notify_command: Option<String>,
+    },
+    /// Disable the honeypot (config is kept).
+    Disable,
+    /// Decode a watermark token back to the visitor record.
+    Decode { token: String },
+    /// Show the current honeypot configuration.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -201,6 +225,23 @@ async fn main() -> Result<()> {
             println!("  Use 'nf stop -i {}' for emergency detach", iface);
             println!("Press Ctrl+C to stop.");
 
+            if cfg.honeypot.enabled && !cfg.honeypot.ports.is_empty() {
+                // Open the honeypot ports to all sources so scanners reach the
+                // userspace responder (default policy is drop). Note: a global
+                // geo/ASN block still precedes the port allow, so a blocked
+                // source won't hit the honeypot — keep those un-blocked for a
+                // true catch-all.
+                let mut ports_map = loader::open_pinned_hashmap::<u32, u32>("ALLOWED_PORTS")?;
+                for &p in &cfg.honeypot.ports {
+                    ports_map.insert(port_key(6, p), ACTION_PASS, 0)?;
+                }
+                println!(
+                    "Honeypot active on tcp {:?} (open to all · watermark + log {})",
+                    cfg.honeypot.ports, cfg.honeypot.log_path
+                );
+                honeypot::serve(cfg.honeypot.clone());
+            }
+
             let events_map = ebpf.take_map("EVENTS").expect("EVENTS map not found");
             let mut perf_array = AsyncPerfEventArray::try_from(events_map)?;
             spawn_perf_readers(&mut perf_array)?;
@@ -317,6 +358,68 @@ async fn main() -> Result<()> {
             RuleAction::List => {
                 println!("=== Compound Rules ===");
                 compound::list_rules()?;
+            }
+        },
+        Commands::Honeypot { action } => match action {
+            HoneypotAction::Enable {
+                port,
+                secret,
+                notify_command,
+            } => {
+                let mut cfg = config::Config::load()?;
+                cfg.honeypot.enabled = true;
+                cfg.honeypot.ports = port;
+                if let Some(s) = secret {
+                    cfg.honeypot.secret = s;
+                }
+                if cfg.honeypot.secret.is_empty() {
+                    cfg.honeypot.secret = honeypot::generate_secret();
+                    println!(
+                        "Generated honeypot secret (store it — needed to decode tokens):\n  {}",
+                        cfg.honeypot.secret
+                    );
+                }
+                if notify_command.is_some() {
+                    cfg.honeypot.notify_command = notify_command;
+                }
+                cfg.save()?;
+                println!(
+                    "Honeypot enabled on tcp {:?}. Restart 'nf run' to activate.",
+                    cfg.honeypot.ports
+                );
+            }
+            HoneypotAction::Disable => {
+                let mut cfg = config::Config::load()?;
+                cfg.honeypot.enabled = false;
+                cfg.save()?;
+                println!("Honeypot disabled. Restart 'nf run' to apply.");
+            }
+            HoneypotAction::Decode { token } => {
+                let cfg = config::Config::load()?;
+                if cfg.honeypot.secret.is_empty() {
+                    anyhow::bail!("No honeypot secret configured");
+                }
+                let json = honeypot::decode_token(&cfg.honeypot.secret, &token)?;
+                println!("{}", json);
+            }
+            HoneypotAction::Status => {
+                let cfg = config::Config::load()?;
+                let hp = &cfg.honeypot;
+                println!("enabled: {}", hp.enabled);
+                println!("ports:   {:?}", hp.ports);
+                println!("log:     {}", hp.log_path);
+                println!(
+                    "notify:  {}",
+                    hp.notify_command.as_deref().unwrap_or("(none)")
+                );
+                println!(
+                    "secret:  {}",
+                    if hp.secret.is_empty() {
+                        "(unset)"
+                    } else {
+                        "(set)"
+                    }
+                );
             }
         },
     }

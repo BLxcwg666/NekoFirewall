@@ -23,6 +23,47 @@ pub struct Config {
     pub block: BlockRules,
     #[serde(default)]
     pub rules: Vec<CompoundRuleEntry>,
+    #[serde(default)]
+    pub honeypot: HoneypotConfig,
+}
+
+/// HTTP honeypot / watermark responder configuration. See `honeypot.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoneypotConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP ports to listen on. Opened to all sources in ALLOWED_PORTS at start.
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    /// Secret used to derive the watermark encryption key. Keep this private.
+    #[serde(default)]
+    pub secret: String,
+    /// Path to the append-only JSONL hit log.
+    #[serde(default = "default_honeypot_log")]
+    pub log_path: String,
+    /// Optional `sh -c` command run on every hit (e.g. curl to a webhook).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_command: Option<String>,
+    /// Optional Server header for the decoy response (default "nginx").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_header: Option<String>,
+}
+
+fn default_honeypot_log() -> String {
+    "/var/log/neko-firewall/honeypot.jsonl".to_string()
+}
+
+impl Default for HoneypotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ports: Vec::new(),
+            secret: String::new(),
+            log_path: default_honeypot_log(),
+            notify_command: None,
+            server_header: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
