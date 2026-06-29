@@ -17,13 +17,21 @@ use neko_common::{
     RULE_PIPELINE_V4_POST, RULE_PIPELINE_V6_BASE, RULE_PIPELINE_V6_POST, RULE_STAGE_COUNT,
 };
 use network_types::{
-    eth::{EthHdr, EtherType},
+    eth::EthHdr,
     ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
     tcp::TcpHdr,
     udp::UdpHdr,
 };
 
 const CONNTRACK_TIMEOUT_NS: u64 = 300_000_000_000;
+
+// EtherType values (host order) used for L2 parsing.
+const ETH_P_IP: u16 = 0x0800;
+const ETH_P_IPV6: u16 = 0x86DD;
+const ETH_P_8021Q: u16 = 0x8100;
+const ETH_P_8021AD: u16 = 0x88A8;
+// Offset of the EtherType field within the base Ethernet header (12).
+const ETH_TYPE_OFFSET: usize = EthHdr::LEN - 2;
 
 #[map]
 static ALLOWED_IPS: LpmTrie<u32, u32> = LpmTrie::pinned(65536, 0);
@@ -106,24 +114,46 @@ fn ipv4_header_len(ipv4hdr: *const Ipv4Hdr) -> Result<usize, ()> {
     Ok(Ipv4Hdr::LEN)
 }
 
+#[inline(always)]
+fn read_ethertype(start: usize, end: usize, offset: usize) -> Result<u16, ()> {
+    let p: *const u16 = ptr_at(start, end, offset)?;
+    Ok(u16::from_be(unsafe { *p }))
+}
+
+/// Parse L2, transparently unwrapping a single 802.1Q/802.1ad VLAN tag.
+/// Returns (inner ethertype, L3 header offset). QinQ (double tag) is not
+/// unwrapped and falls through to the non-IP path.
+#[inline(always)]
+fn parse_l2(start: usize, end: usize) -> Result<(u16, usize), ()> {
+    // Ensure the base Ethernet header is present before reading further.
+    let _eth: *const EthHdr = ptr_at(start, end, 0)?;
+    let eth_type = read_ethertype(start, end, ETH_TYPE_OFFSET)?;
+    if eth_type == ETH_P_8021Q || eth_type == ETH_P_8021AD {
+        // VLAN tag layout: [TPID(2)][TCI(2)][inner ethertype(2)][payload].
+        let inner = read_ethertype(start, end, EthHdr::LEN + 2)?;
+        return Ok((inner, EthHdr::LEN + 4));
+    }
+    Ok((eth_type, EthHdr::LEN))
+}
+
 fn try_neko_firewall(ctx: &XdpContext) -> Result<u32, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    let ethhdr: *const EthHdr = ptr_at(start, end, 0)?;
-    match unsafe { (*ethhdr).ether_type } {
-        EtherType::Ipv4 => try_firewall_v4(ctx, start, end),
-        EtherType::Ipv6 => try_firewall_v6(ctx, start, end),
+    let (eth_type, l3_off) = parse_l2(start, end)?;
+    match eth_type {
+        ETH_P_IP => try_firewall_v4(ctx, start, end, l3_off),
+        ETH_P_IPV6 => try_firewall_v6(ctx, start, end, l3_off),
         _ => Ok(xdp_action::XDP_PASS),
     }
 }
 
-fn try_firewall_v4(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()> {
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, EthHdr::LEN)?;
+fn try_firewall_v4(ctx: &XdpContext, start: usize, end: usize, l3_off: usize) -> Result<u32, ()> {
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, l3_off)?;
     let src_addr = unsafe { (*ipv4hdr).src_addr };
     let dst_addr = unsafe { (*ipv4hdr).dst_addr };
     let proto = unsafe { (*ipv4hdr).proto };
-    let transport_offset = EthHdr::LEN + ipv4_header_len(ipv4hdr)?;
+    let transport_offset = l3_off + ipv4_header_len(ipv4hdr)?;
     let proto_num = proto_to_num(proto);
 
     let ip_key = Key::new(32, src_addr);
@@ -180,16 +210,25 @@ fn try_firewall_v4(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
     };
     store_packet_ctx_v4(&packet)?;
 
-    let _ = unsafe { RULE_PIPELINE.tail_call(ctx, RULE_PIPELINE_V4_BASE) };
-    Ok(post_rules_v4_action(&packet, ctx))
+    // Fail-closed: if the rule pipeline can't be entered, drop rather than
+    // silently skipping all compound rules and falling through to post-rules.
+    tail_call_program(ctx, RULE_PIPELINE_V4_BASE)
 }
 
-fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()> {
-    let ipv6hdr: *const Ipv6Hdr = ptr_at(start, end, EthHdr::LEN)?;
+fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize, l3_off: usize) -> Result<u32, ()> {
+    let ipv6hdr: *const Ipv6Hdr = ptr_at(start, end, l3_off)?;
     let src_addr: [u8; 16] = unsafe { (*ipv6hdr).src_addr.in6_u.u6_addr8 };
     let dst_addr: [u8; 16] = unsafe { (*ipv6hdr).dst_addr.in6_u.u6_addr8 };
     let next_hdr = unsafe { (*ipv6hdr).next_hdr };
-    let transport_offset = EthHdr::LEN + Ipv6Hdr::LEN;
+    let transport_offset = l3_off + Ipv6Hdr::LEN;
+
+    // Source allow-list first (mirrors the v4 path): a whitelisted source must
+    // short-circuit before any protocol-based drop, otherwise v6 allow-list
+    // entries are bypassed for fragment / extension-header traffic.
+    let ip_key = Key::new(128, src_addr);
+    if ALLOWED_IPS6.get(&ip_key).is_some() {
+        return Ok(xdp_action::XDP_PASS);
+    }
 
     let proto_num = match next_hdr {
         IpProto::Tcp => 6u8,
@@ -197,11 +236,6 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
         IpProto::Ipv6Icmp => 58u8,
         _ => return Ok(xdp_action::XDP_DROP),
     };
-
-    let ip_key = Key::new(128, src_addr);
-    if ALLOWED_IPS6.get(&ip_key).is_some() {
-        return Ok(xdp_action::XDP_PASS);
-    }
 
     let (src_port, dst_port, ct_src_port, ct_dst_port) = match next_hdr {
         IpProto::Tcp => {
@@ -234,7 +268,8 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
             }
             (0u16, icmp_type as u16, 0u16, 0u16)
         }
-        _ => return Ok(xdp_action::XDP_PASS),
+        // Unreachable: non-TCP/UDP/ICMPv6 already dropped above. Fail-closed.
+        _ => return Ok(xdp_action::XDP_DROP),
     };
 
     let geo_key = Key::new(128, src_addr);
@@ -255,8 +290,8 @@ fn try_firewall_v6(ctx: &XdpContext, start: usize, end: usize) -> Result<u32, ()
     };
     store_packet_ctx_v6(&packet)?;
 
-    let _ = unsafe { RULE_PIPELINE.tail_call(ctx, RULE_PIPELINE_V6_BASE) };
-    Ok(post_rules_v6_action(&packet, ctx))
+    // Fail-closed: see try_firewall_v4.
+    tail_call_program(ctx, RULE_PIPELINE_V6_BASE)
 }
 
 #[inline(always)]
@@ -536,6 +571,12 @@ macro_rules! define_v6_stage {
     };
 }
 
+// The stage functions defined below must stay in sync with RULE_STAGE_COUNT.
+const _: () = assert!(
+    RULE_STAGE_COUNT == 8,
+    "RULE_STAGE_COUNT changed: update the define_*_stage! invocations below"
+);
+
 define_v4_stage!(compound_v4_stage_0, 0);
 define_v4_stage!(compound_v4_stage_1, 1);
 define_v4_stage!(compound_v4_stage_2, 2);
@@ -619,7 +660,10 @@ fn post_rules_v4_action(packet: &PacketCtxV4, ctx: &XdpContext) -> u32 {
     if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
         return xdp_action::XDP_PASS;
     }
-    if packet.dst_port > 0 {
+    // Port allow-list only applies to TCP/UDP. For ICMP, dst_port carries the
+    // ICMP type, so these lookups would let an `any/<type>` port rule leak
+    // ICMP through. The proto-wildcard check above still covers `allow icmp`.
+    if packet.dst_port > 0 && (packet.proto == 6 || packet.proto == 17) {
         let pk = port_key(packet.proto, packet.dst_port);
         if unsafe { ALLOWED_PORTS.get(&pk) }.is_some() {
             return xdp_action::XDP_PASS;
@@ -708,7 +752,8 @@ fn post_rules_v6_action(packet: &PacketCtxV6, ctx: &XdpContext) -> u32 {
     if unsafe { ALLOWED_PORTS.get(&proto_wildcard) }.is_some() {
         return xdp_action::XDP_PASS;
     }
-    if packet.dst_port > 0 {
+    // See post_rules_v4_action: restrict port allow-list to TCP/UDP.
+    if packet.dst_port > 0 && (packet.proto == 6 || packet.proto == 17) {
         let pk = port_key(packet.proto, packet.dst_port);
         if unsafe { ALLOWED_PORTS.get(&pk) }.is_some() {
             return xdp_action::XDP_PASS;
@@ -760,20 +805,20 @@ fn try_neko_egress(ctx: &TcContext) -> Result<i32, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
 
-    let ethhdr: *const EthHdr = ptr_at(start, end, 0)?;
-    match unsafe { (*ethhdr).ether_type } {
-        EtherType::Ipv4 => try_egress_v4(start, end),
-        EtherType::Ipv6 => try_egress_v6(start, end),
+    let (eth_type, l3_off) = parse_l2(start, end)?;
+    match eth_type {
+        ETH_P_IP => try_egress_v4(start, end, l3_off),
+        ETH_P_IPV6 => try_egress_v6(start, end, l3_off),
         _ => Ok(0),
     }
 }
 
-fn try_egress_v4(start: usize, end: usize) -> Result<i32, ()> {
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, EthHdr::LEN)?;
+fn try_egress_v4(start: usize, end: usize, l3_off: usize) -> Result<i32, ()> {
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(start, end, l3_off)?;
     let src_addr = unsafe { (*ipv4hdr).src_addr };
     let dst_addr = unsafe { (*ipv4hdr).dst_addr };
     let proto = unsafe { (*ipv4hdr).proto };
-    let transport_offset = EthHdr::LEN + ipv4_header_len(ipv4hdr)?;
+    let transport_offset = l3_off + ipv4_header_len(ipv4hdr)?;
 
     let (raw_src_port, raw_dst_port) = match proto {
         IpProto::Tcp => {
@@ -803,12 +848,12 @@ fn try_egress_v4(start: usize, end: usize) -> Result<i32, ()> {
     Ok(0)
 }
 
-fn try_egress_v6(start: usize, end: usize) -> Result<i32, ()> {
-    let ipv6hdr: *const Ipv6Hdr = ptr_at(start, end, EthHdr::LEN)?;
+fn try_egress_v6(start: usize, end: usize, l3_off: usize) -> Result<i32, ()> {
+    let ipv6hdr: *const Ipv6Hdr = ptr_at(start, end, l3_off)?;
     let src_addr: [u8; 16] = unsafe { (*ipv6hdr).src_addr.in6_u.u6_addr8 };
     let dst_addr: [u8; 16] = unsafe { (*ipv6hdr).dst_addr.in6_u.u6_addr8 };
     let next_hdr = unsafe { (*ipv6hdr).next_hdr };
-    let transport_offset = EthHdr::LEN + Ipv6Hdr::LEN;
+    let transport_offset = l3_off + Ipv6Hdr::LEN;
 
     let (raw_src_port, raw_dst_port, proto_num) = match next_hdr {
         IpProto::Tcp => {
@@ -851,7 +896,11 @@ fn proto_to_num(proto: IpProto) -> u8 {
 
 #[inline(always)]
 fn icmpv6_type_must_pass(icmp_type: u8) -> bool {
-    matches!(icmp_type, 1 | 2 | 3 | 4 | 133 | 134 | 135 | 136 | 137)
+    // Only NDP / SLAAC control messages are passed unconditionally:
+    //   133 Router Solicitation, 134 Router Advertisement,
+    //   135 Neighbor Solicitation, 136 Neighbor Advertisement.
+    // Everything else (incl. 1-4 errors, 137 Redirect) goes through full policy.
+    matches!(icmp_type, 133..=136)
 }
 
 #[inline(always)]

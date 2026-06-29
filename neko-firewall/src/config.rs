@@ -77,8 +77,14 @@ impl Config {
         std::fs::create_dir_all(CONFIG_DIR)
             .with_context(|| format!("Failed to create {}", CONFIG_DIR))?;
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        std::fs::write(CONFIG_PATH, content)
-            .with_context(|| format!("Failed to write {}", CONFIG_PATH))
+        // Write to a temp file in the same dir, then atomically rename over the
+        // target, so a crash mid-write can't leave a truncated/corrupt config
+        // that fails to parse on the next start.
+        let tmp_path = format!("{}.tmp", CONFIG_PATH);
+        std::fs::write(&tmp_path, content)
+            .with_context(|| format!("Failed to write {}", tmp_path))?;
+        std::fs::rename(&tmp_path, CONFIG_PATH)
+            .with_context(|| format!("Failed to replace {}", CONFIG_PATH))
     }
 
     pub fn apply(&self) -> Result<()> {
@@ -347,8 +353,10 @@ impl CompoundRuleEntry {
     pub(crate) fn to_bpf_rule(&self) -> Option<CompoundRule> {
         let action = match self.action.as_str() {
             "allow" => ACTION_PASS,
-            "drop" | "block" => ACTION_DROP,
-            _ => return None,
+            // Fail-closed: anything that isn't an explicit allow becomes a drop.
+            // An unknown/typo'd action must never silently disable a rule that
+            // was meant to block traffic ("drop", "block", "deny", ...).
+            _ => ACTION_DROP,
         };
         let mut bpf_rule = CompoundRule::default();
         bpf_rule.action = action;

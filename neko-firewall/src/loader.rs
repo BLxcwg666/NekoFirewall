@@ -88,6 +88,14 @@ pub fn reset_runtime_maps(ebpf: &mut Ebpf) -> Result<()> {
     clear_lpm_trie::<u32, u32>(ebpf, "GEO_ASN_MAP")?;
     clear_lpm_trie::<[u8; 16], u32>(ebpf, "GEO_COUNTRY_MAP6")?;
     clear_lpm_trie::<[u8; 16], u32>(ebpf, "GEO_ASN_MAP6")?;
+    // Clear allow-lists and geo policy too. apply() only ever *inserts* into
+    // these, so without a reset, stale pinned entries (e.g. after a kill -9
+    // and a subsequent config edit) would survive a restart and keep allowing
+    // traffic that is no longer in the config.
+    clear_lpm_trie::<u32, u32>(ebpf, "ALLOWED_IPS")?;
+    clear_lpm_trie::<[u8; 16], u32>(ebpf, "ALLOWED_IPS6")?;
+    clear_hashmap::<u32, u32>(ebpf, "ALLOWED_PORTS")?;
+    clear_hashmap::<u32, u32>(ebpf, "GEO_POLICY")?;
     clear_array::<CompoundRule>(ebpf, "RULES_V4")?;
     clear_array::<CompoundRule>(ebpf, "RULES_V6")?;
     set_runtime_flags_in_ebpf(ebpf, 0)?;
@@ -233,6 +241,24 @@ fn clear_lpm_trie<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
     let keys = typed
         .keys()
         .collect::<std::result::Result<Vec<Key<K>>, _>>()
+        .with_context(|| format!("Failed to enumerate {}", name))?;
+    for key in keys {
+        typed
+            .remove(&key)
+            .with_context(|| format!("Failed to clear {}", name))?;
+    }
+    Ok(())
+}
+
+fn clear_hashmap<K: Pod, V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<()> {
+    let map = ebpf
+        .map_mut(name)
+        .with_context(|| format!("{} map not found", name))?;
+    let mut typed: HashMap<_, K, V> = HashMap::try_from(map)
+        .map_err(|e| anyhow::anyhow!("Failed to open {} as HashMap: {:?}", name, e))?;
+    let keys = typed
+        .keys()
+        .collect::<std::result::Result<Vec<K>, _>>()
         .with_context(|| format!("Failed to enumerate {}", name))?;
     for key in keys {
         typed
