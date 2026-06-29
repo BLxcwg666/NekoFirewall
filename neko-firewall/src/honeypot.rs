@@ -15,11 +15,14 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::config::HoneypotConfig;
 
@@ -71,6 +74,7 @@ struct VisitorInfo {
 
 #[derive(Serialize)]
 struct HitRecord<'a> {
+    node: &'a str,
     #[serde(flatten)]
     visitor: &'a VisitorInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,21 +82,52 @@ struct HitRecord<'a> {
     dst_port: u16,
 }
 
+/// Internal event sent from a connection handler to the notification aggregator.
+struct HitEvent {
+    visitor: VisitorInfo,
+    token: Option<String>,
+    dst_port: u16,
+}
+
 /// Spawn a listener task per configured port. Returns immediately; the tasks
 /// run until the process exits.
 pub fn serve(cfg: HoneypotConfig) {
     let key = derive_key(&cfg.secret);
+    let node = Arc::new(node_name(&cfg));
+    let limiter = Arc::new(Semaphore::new(cfg.max_connections.max(1)));
+
+    // All notifications flow through one aggregator that debounces per source
+    // IP and collapses floods into periodic summaries, so a DDoS to the
+    // honeypot port can't fan out into a notification storm.
+    let (tx, rx) = mpsc::channel::<HitEvent>(1024);
+    {
+        let cfg = cfg.clone();
+        let node = node.clone();
+        tokio::spawn(async move { aggregator(rx, cfg, node).await });
+    }
+
+    log::info!("[honeypot] node={} max_conns={}", node, cfg.max_connections);
     for &port in &cfg.ports {
         let cfg = cfg.clone();
+        let node = node.clone();
+        let limiter = limiter.clone();
+        let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = listen(port, cfg, key).await {
+            if let Err(e) = listen(port, cfg, key, node, limiter, tx).await {
                 log::error!("[honeypot] listener on :{} stopped: {}", port, e);
             }
         });
     }
 }
 
-async fn listen(port: u16, cfg: HoneypotConfig, key: [u8; 32]) -> Result<()> {
+async fn listen(
+    port: u16,
+    cfg: HoneypotConfig,
+    key: [u8; 32],
+    node: Arc<String>,
+    limiter: Arc<Semaphore>,
+    tx: mpsc::Sender<HitEvent>,
+) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("failed to bind honeypot port {}", port))?;
@@ -100,9 +135,17 @@ async fn listen(port: u16, cfg: HoneypotConfig, key: [u8; 32]) -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                // Flood guard: if every handler slot is busy, drop the
+                // connection now instead of spawning unbounded work.
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    continue;
+                };
                 let cfg = cfg.clone();
+                let node = node.clone();
+                let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, peer, port, &cfg, &key).await {
+                    let _permit = permit;
+                    if let Err(e) = handle(stream, peer, port, &cfg, &key, &node, &tx).await {
                         log::debug!("[honeypot] connection from {} error: {}", peer, e);
                     }
                 });
@@ -115,12 +158,15 @@ async fn listen(port: u16, cfg: HoneypotConfig, key: [u8; 32]) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: TcpStream,
     peer: SocketAddr,
     dst_port: u16,
     cfg: &HoneypotConfig,
     key: &[u8; 32],
+    node: &str,
+    tx: &mpsc::Sender<HitEvent>,
 ) -> Result<()> {
     // Read whatever the client sends first (may be nothing: a bare port scan).
     let mut buf = vec![0u8; MAX_REQUEST];
@@ -142,14 +188,22 @@ async fn handle(
 
     // The watermark token is only computed/embedded when explicitly enabled.
     // By default the honeypot stays a byte-identical nginx page (every hit is
-    // still captured via the notification + log), so it can't be fingerprinted
+    // still captured via the log + notification), so it can't be fingerprinted
     // as a honeypot by the tag itself.
     let token = if cfg.watermark {
         Some(encode_token(key, &visitor)?)
     } else {
         None
     };
-    record_hit(cfg, &visitor, token.as_deref(), dst_port).await;
+
+    // Always log every hit at full fidelity; the aggregator decides whether to
+    // notify (so a flood floods the log, not your phone).
+    log_hit(cfg, node, &visitor, token.as_deref(), dst_port).await;
+    let _ = tx.try_send(HitEvent {
+        visitor: visitor.clone(),
+        token: token.clone(),
+        dst_port,
+    });
 
     let body = build_body(token.as_deref());
     let server = cfg.server_header.as_deref().unwrap_or("nginx");
@@ -258,9 +312,17 @@ fn http_date(secs: u64) -> String {
     )
 }
 
-async fn record_hit(cfg: &HoneypotConfig, visitor: &VisitorInfo, token: Option<&str>, dst_port: u16) {
+/// Append a full-fidelity record for every hit (never debounced).
+async fn log_hit(
+    cfg: &HoneypotConfig,
+    node: &str,
+    visitor: &VisitorInfo,
+    token: Option<&str>,
+    dst_port: u16,
+) {
     log::warn!(
-        "[honeypot] HIT :{} from {}:{} {} {} ua={:?}",
+        "[honeypot] HIT [{}] :{} from {}:{} {} {} ua={:?}",
+        node,
         dst_port,
         visitor.ip,
         visitor.port,
@@ -270,19 +332,217 @@ async fn record_hit(cfg: &HoneypotConfig, visitor: &VisitorInfo, token: Option<&
     );
 
     let record = HitRecord {
+        node,
         visitor,
         token,
         dst_port,
     };
     let json = serde_json::to_string(&record).unwrap_or_default();
-
     if let Err(e) = append_log(&cfg.log_path, &json).await {
         log::warn!("[honeypot] failed to write log {}: {}", cfg.log_path, e);
     }
+}
 
-    if let Some(cmd) = cfg.notify_command.as_deref() {
-        fire_notify(cmd, visitor, token.unwrap_or(""), dst_port, &json).await;
+/// Resolve this node's name: explicit config, else the system hostname.
+fn node_name(cfg: &HoneypotConfig) -> String {
+    if let Some(n) = &cfg.node_name {
+        if !n.is_empty() {
+            return n.clone();
+        }
     }
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Decides whether an individual notification should be sent. Pure state +
+/// explicit `now`, so the anti-storm logic is unit-testable without timers.
+struct NotifyGate {
+    dedup: Duration,
+    max_per_min: u32,
+    last_notified: HashMap<String, Instant>,
+    win_notified: u32,
+}
+
+impl NotifyGate {
+    fn new(dedup: Duration, max_per_min: u32) -> Self {
+        Self {
+            dedup,
+            max_per_min,
+            last_notified: HashMap::new(),
+            win_notified: 0,
+        }
+    }
+
+    /// True iff `ip` should get an individual notification now: not seen within
+    /// the dedup window, and the per-minute budget isn't exhausted.
+    fn admit(&mut self, ip: &str, now: Instant) -> bool {
+        let deduped = self
+            .last_notified
+            .get(ip)
+            .map(|t| now.duration_since(*t) < self.dedup)
+            .unwrap_or(false);
+        if deduped || self.win_notified >= self.max_per_min {
+            return false;
+        }
+        self.last_notified.insert(ip.to_string(), now);
+        self.win_notified += 1;
+        true
+    }
+
+    /// Roll the per-minute window: reset the budget, prune stale dedup entries.
+    fn roll_window(&mut self, now: Instant) {
+        self.win_notified = 0;
+        let dedup = self.dedup;
+        self.last_notified
+            .retain(|_, t| now.duration_since(*t) < dedup);
+    }
+}
+
+/// Notification aggregator: debounce per source IP + per-minute rate cap, with
+/// the overflow folded into a single summary so floods never spam.
+async fn aggregator(mut rx: mpsc::Receiver<HitEvent>, cfg: HoneypotConfig, node: Arc<String>) {
+    let mut gate = NotifyGate::new(
+        Duration::from_secs(cfg.notify_dedup_secs.max(1)),
+        cfg.notify_max_per_min,
+    );
+    let mut win_total: u64 = 0;
+    let mut win_notified: u64 = 0;
+    let mut win_ips: HashMap<String, u64> = HashMap::new();
+
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    tick.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                let Some(ev) = maybe else { break; };
+                if cfg.notify_command.is_none() {
+                    continue;
+                }
+                win_total += 1;
+                let count = {
+                    let c = win_ips.entry(ev.visitor.ip.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if gate.admit(&ev.visitor.ip, Instant::now()) {
+                    win_notified += 1;
+                    notify_hit(&cfg, node.as_str(), &ev, count).await;
+                }
+            }
+            _ = tick.tick() => {
+                let folded = win_total.saturating_sub(win_notified);
+                if folded > 0 {
+                    notify_summary(&cfg, node.as_str(), win_total, win_notified, &win_ips).await;
+                }
+                win_total = 0;
+                win_notified = 0;
+                win_ips.clear();
+                gate.roll_window(Instant::now());
+            }
+        }
+    }
+}
+
+async fn notify_hit(cfg: &HoneypotConfig, node: &str, ev: &HitEvent, count: u64) {
+    let Some(cmd) = cfg.notify_command.as_deref() else {
+        return;
+    };
+    let v = &ev.visitor;
+    let time = http_date(v.ts);
+    let method = if v.method.is_empty() { "-" } else { v.method.as_str() };
+    let path = if v.path.is_empty() { "-" } else { v.path.as_str() };
+    let repeat = if count > 1 {
+        format!(" ({}x in window)", count)
+    } else {
+        String::new()
+    };
+    let text = format!(
+        "🚨 [{node}] honeypot tcp/{dp} hit\nfrom {ip}:{sp}{repeat}\n{method} {path}  Host: {host}\nUA: {ua}\n{time}",
+        node = node,
+        dp = ev.dst_port,
+        ip = v.ip,
+        sp = v.port,
+        repeat = repeat,
+        method = method,
+        path = path,
+        host = if v.host.is_empty() { "-" } else { v.host.as_str() },
+        ua = if v.ua.is_empty() { "-" } else { v.ua.as_str() },
+        time = time,
+    );
+    let fields = vec![
+        ("NEKO_HP_KIND", "hit".to_string()),
+        ("NEKO_HP_NODE", node.to_string()),
+        ("NEKO_HP_IP", v.ip.clone()),
+        ("NEKO_HP_PORT", v.port.to_string()),
+        ("NEKO_HP_DST_PORT", ev.dst_port.to_string()),
+        ("NEKO_HP_TS", v.ts.to_string()),
+        ("NEKO_HP_TIME", time.clone()),
+        ("NEKO_HP_METHOD", v.method.clone()),
+        ("NEKO_HP_PATH", v.path.clone()),
+        ("NEKO_HP_HOST", v.host.clone()),
+        ("NEKO_HP_UA", v.ua.clone()),
+        ("NEKO_HP_COUNT", count.to_string()),
+        ("NEKO_HP_TOKEN", ev.token.clone().unwrap_or_default()),
+    ];
+    let json = serde_json::json!({
+        "kind": "hit", "node": node, "count": count,
+        "ip": v.ip, "port": v.port, "dst_port": ev.dst_port,
+        "ts": v.ts, "time": time, "method": v.method, "path": v.path,
+        "host": v.host, "ua": v.ua, "token": ev.token,
+    })
+    .to_string();
+    send_notification(cmd, &fields, &text, &json).await;
+}
+
+async fn notify_summary(
+    cfg: &HoneypotConfig,
+    node: &str,
+    total: u64,
+    notified: u64,
+    win_ips: &HashMap<String, u64>,
+) {
+    let Some(cmd) = cfg.notify_command.as_deref() else {
+        return;
+    };
+    let unique = win_ips.len();
+    let folded = total.saturating_sub(notified);
+    let mut top: Vec<(&String, &u64)> = win_ips.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let top_str = top
+        .iter()
+        .take(5)
+        .map(|(ip, c)| format!("{}×{}", ip, c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "⚠️ [{node}] honeypot flood: {total} hits / {unique} IPs in 60s\n{notified} notified, {folded} folded\ntop: {top}",
+        node = node,
+        total = total,
+        unique = unique,
+        notified = notified,
+        folded = folded,
+        top = top_str,
+    );
+    let fields = vec![
+        ("NEKO_HP_KIND", "flood".to_string()),
+        ("NEKO_HP_NODE", node.to_string()),
+        ("NEKO_HP_TOTAL", total.to_string()),
+        ("NEKO_HP_UNIQUE", unique.to_string()),
+        ("NEKO_HP_NOTIFIED", notified.to_string()),
+        ("NEKO_HP_FOLDED", folded.to_string()),
+        ("NEKO_HP_WINDOW", "60".to_string()),
+        ("NEKO_HP_TOP", top_str.clone()),
+    ];
+    let json = serde_json::json!({
+        "kind": "flood", "node": node, "total": total, "unique": unique,
+        "notified": notified, "folded": folded, "window_secs": 60, "top": top_str,
+    })
+    .to_string();
+    send_notification(cmd, &fields, &text, &json).await;
 }
 
 async fn append_log(path: &str, line: &str) -> Result<()> {
@@ -300,23 +560,18 @@ async fn append_log(path: &str, line: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run the user-defined notification command via `sh -c`, exposing the visitor
-/// fields as environment variables and the full JSON record on stdin. Fully
-/// detached: failures never affect the response.
-async fn fire_notify(cmd: &str, visitor: &VisitorInfo, token: &str, dst_port: u16, json: &str) {
+/// Run the user-defined notification command via `sh -c`, exposing the given
+/// `NEKO_HP_*` fields plus a prebuilt `NEKO_HP_TEXT` message as environment
+/// variables and the full JSON record on stdin. Fully detached: failures never
+/// affect the response.
+async fn send_notification(cmd: &str, fields: &[(&str, String)], text: &str, json: &str) {
     let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(cmd);
+    for (k, v) in fields {
+        command.env(k, v);
+    }
     command
-        .arg("-c")
-        .arg(cmd)
-        .env("NEKO_HP_IP", &visitor.ip)
-        .env("NEKO_HP_PORT", visitor.port.to_string())
-        .env("NEKO_HP_DST_PORT", dst_port.to_string())
-        .env("NEKO_HP_TS", visitor.ts.to_string())
-        .env("NEKO_HP_METHOD", &visitor.method)
-        .env("NEKO_HP_PATH", &visitor.path)
-        .env("NEKO_HP_HOST", &visitor.host)
-        .env("NEKO_HP_UA", &visitor.ua)
-        .env("NEKO_HP_TOKEN", token)
+        .env("NEKO_HP_TEXT", text)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -451,6 +706,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notify_gate_debounces_and_rate_limits() {
+        let base = Instant::now();
+        let mut gate = NotifyGate::new(Duration::from_secs(300), 3);
+
+        // First hit from an IP is admitted; repeats within the window are not.
+        assert!(gate.admit("1.1.1.1", base));
+        assert!(!gate.admit("1.1.1.1", base + Duration::from_secs(10)));
+        assert!(!gate.admit("1.1.1.1", base + Duration::from_secs(299)));
+        // After the dedup window, the same IP is admitted again.
+        assert!(gate.admit("1.1.1.1", base + Duration::from_secs(301)));
+
+        // Per-minute budget (3) caps distinct IPs; the 4th is folded.
+        let mut gate = NotifyGate::new(Duration::from_secs(300), 3);
+        assert!(gate.admit("a", base));
+        assert!(gate.admit("b", base));
+        assert!(gate.admit("c", base));
+        assert!(!gate.admit("d", base)); // budget exhausted -> folded into summary
+        // Rolling the window restores the budget.
+        gate.roll_window(base + Duration::from_secs(60));
+        assert!(gate.admit("d", base + Duration::from_secs(60)));
+    }
+
+    #[test]
     fn nginx_page_matches_upstream_size() {
         // nginx's current default index.html is 896 bytes; guard byte fidelity.
         assert_eq!(NGINX_PAGE.len(), 896);
@@ -502,6 +780,10 @@ mod tests {
             notify_command: None,
             server_header: None,
             watermark: true,
+            node_name: Some("test-node".into()),
+            notify_dedup_secs: 300,
+            notify_max_per_min: 10,
+            max_connections: 16,
         };
         serve(cfg);
 
@@ -551,6 +833,10 @@ mod tests {
             notify_command: None,
             server_header: None,
             watermark: false,
+            node_name: Some("test-node".into()),
+            notify_dedup_secs: 300,
+            notify_max_per_min: 10,
+            max_connections: 16,
         };
         serve(cfg);
 

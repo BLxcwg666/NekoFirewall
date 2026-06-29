@@ -53,10 +53,38 @@ pub struct HoneypotConfig {
     /// (so a scanning platform indexes a token you can later decode/search).
     #[serde(default)]
     pub watermark: bool,
+    /// Identifier for this host in logs/notifications. Defaults to the system
+    /// hostname — set it when running on many machines to tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    /// Per-source-IP notification debounce: at most one notification per this
+    /// many seconds for the same IP (every hit is still logged).
+    #[serde(default = "default_dedup_secs")]
+    pub notify_dedup_secs: u64,
+    /// Global cap on individual notifications per minute. Excess hits are folded
+    /// into a single periodic summary so a flood can't blow up your inbox.
+    #[serde(default = "default_max_per_min")]
+    pub notify_max_per_min: u32,
+    /// Max concurrent connections served at once (flood guard); excess
+    /// connections are dropped immediately.
+    #[serde(default = "default_max_conns")]
+    pub max_connections: usize,
 }
 
 fn default_honeypot_log() -> String {
     "/var/log/neko-firewall/honeypot.jsonl".to_string()
+}
+
+fn default_dedup_secs() -> u64 {
+    300
+}
+
+fn default_max_per_min() -> u32 {
+    10
+}
+
+fn default_max_conns() -> usize {
+    256
 }
 
 impl Default for HoneypotConfig {
@@ -69,6 +97,10 @@ impl Default for HoneypotConfig {
             notify_command: None,
             server_header: None,
             watermark: false,
+            node_name: None,
+            notify_dedup_secs: default_dedup_secs(),
+            notify_max_per_min: default_max_per_min(),
+            max_connections: default_max_conns(),
         }
     }
 }

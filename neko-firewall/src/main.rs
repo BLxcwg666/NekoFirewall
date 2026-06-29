@@ -68,6 +68,9 @@ enum HoneypotAction {
         secret: Option<String>,
         #[arg(long)]
         notify_command: Option<String>,
+        /// Identifier for this host in notifications (defaults to the hostname).
+        #[arg(long)]
+        node_name: Option<String>,
         /// Embed an encrypted watermark token in responses (for counter-mapping).
         #[arg(long)]
         watermark: bool,
@@ -368,12 +371,16 @@ async fn main() -> Result<()> {
                 port,
                 secret,
                 notify_command,
+                node_name,
                 watermark,
             } => {
                 let mut cfg = config::Config::load()?;
                 cfg.honeypot.enabled = true;
                 cfg.honeypot.ports = port;
                 cfg.honeypot.watermark = watermark;
+                if node_name.is_some() {
+                    cfg.honeypot.node_name = node_name;
+                }
                 if let Some(s) = secret {
                     cfg.honeypot.secret = s;
                 }
@@ -412,6 +419,7 @@ async fn main() -> Result<()> {
                 let cfg = config::Config::load()?;
                 let hp = &cfg.honeypot;
                 println!("enabled:   {}", hp.enabled);
+                println!("node:      {}", hp.node_name.as_deref().unwrap_or("(hostname)"));
                 println!("ports:     {:?}", hp.ports);
                 println!("watermark: {}", hp.watermark);
                 println!("log:       {}", hp.log_path);
@@ -419,6 +427,11 @@ async fn main() -> Result<()> {
                     "notify:    {}",
                     hp.notify_command.as_deref().unwrap_or("(none)")
                 );
+                println!(
+                    "debounce:  {}s per IP, max {}/min (then folded into a summary)",
+                    hp.notify_dedup_secs, hp.notify_max_per_min
+                );
+                println!("max conns: {}", hp.max_connections);
                 println!(
                     "secret:    {}",
                     if hp.secret.is_empty() {
